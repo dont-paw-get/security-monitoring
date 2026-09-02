@@ -1,0 +1,29 @@
+# 상용 (main 브랜치 → dpyb-prod 클러스터 / dpyb-security-monitoring-prod 네임스페이스)
+#
+# ⚠️ 중앙 ArgoCD 구조: 이 Application 은 ArgoCD 가 떠 있는 클러스터가 아니라
+#    원격 dpyb-prod 클러스터로 배포합니다. destination.name 은 반드시
+#    `argocd cluster add ... --name dpyb-prod` 로 등록해 둔 이름이어야 합니다.
+#    아직 등록 안 했다면 등록 먼저! (미등록 시 "cluster not found" 로 sync 실패)
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: security-monitoring-prod
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/dont-paw-get/security-monitoring.git
+    targetRevision: main             # 상용 브랜치를 추적
+    path: k8s/overlays/prod          # prod overlay 적용
+  destination:
+    # dpyb-prod 원격 클러스터. `argocd cluster list` 로 등록 이름 확인.
+    name: dpyb-prod
+    namespace: dpyb-security-monitoring-prod
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

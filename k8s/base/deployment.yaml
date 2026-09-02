@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: security-monitoring
+  labels:
+    app.kubernetes.io/name: security-monitoring
+spec:
+  # replicas 는 overlay 에서 환경별로 지정 (dev=1, prod=2 — prod 는 현재 주석 상태)
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: security-monitoring
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: security-monitoring
+    spec:
+      # CLIAR-252: 이 서비스는 DB를 소유하지 않으므로(app/core/config.py)
+      # 마이그레이션 initContainer가 없다(backend-record와 동일한 이유).
+      serviceAccountName: security-monitoring
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: security-monitoring
+          # 이미지 실제 경로/태그는 overlay 의 images: 트랜스포머가 주입 (CI 가 태그 갱신)
+          image: security-monitoring
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: security-monitoring-config
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL

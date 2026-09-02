@@ -1,0 +1,25 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 상용 환경 (main 브랜치 → dpyb-prod 클러스터 / dpyb-security-monitoring-prod 네임스페이스)
+namespace: dpyb-security-monitoring-prod
+
+resources:
+  - ../../base
+
+# 상용은 2개
+replicas:
+  - name: security-monitoring
+    count: 2
+
+# 상용용 이미지. CI 가 newTag 를 커밋 SHA 로 갱신합니다.
+# prod 리포는 IMMUTABLE 이므로 movable 태그(main-latest)는 쓰지 않고
+# 항상 커밋 SHA 로만 배포합니다. (아래 newTag 는 첫 CI 실행 전 placeholder)
+images:
+  - name: security-monitoring
+    newName: 594532711953.dkr.ecr.ap-northeast-2.amazonaws.com/dpyb-prod/dpyb-security-monitoring
+    newTag: placeholder-set-by-ci
+
+# 상용 환경에서 달라지는 설정값만 덮어씀
+patches:
+  - path: configmap-patch.yaml

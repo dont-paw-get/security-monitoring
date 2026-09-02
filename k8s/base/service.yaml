@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: security-monitoring
+  labels:
+    app.kubernetes.io/name: security-monitoring
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: security-monitoring
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

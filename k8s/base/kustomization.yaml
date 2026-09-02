@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 공통 매니페스트. 네임스페이스/이미지태그/환경별 값은 overlay 에서 주입합니다.
+# CLIAR-252: 외부 사용자 API가 없으므로 ingress.yaml 은 두지 않습니다.
+resources:
+  - serviceaccount.yaml
+  - configmap.yaml
+  - deployment.yaml
+  - service.yaml

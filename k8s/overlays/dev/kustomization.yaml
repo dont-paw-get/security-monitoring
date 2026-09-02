@@ -1,0 +1,25 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 개발 환경 (develop 브랜치 → dpyb-security-monitoring-dev 네임스페이스)
+namespace: dpyb-security-monitoring-dev
+
+resources:
+  - ../../base
+  # dev 전용: Prometheus 스크레이핑 대상 등록 (관측 인프라 연동, dev 한정)
+  - servicemonitor.yaml
+
+# 개발은 1개만
+replicas:
+  - name: security-monitoring
+    count: 1
+
+# 개발용 이미지. CI 가 newTag 를 커밋 SHA 로 갱신합니다(첫 CI 실행 전 placeholder).
+images:
+  - name: security-monitoring
+    newName: 594532711953.dkr.ecr.ap-northeast-2.amazonaws.com/dpyb-dev/dpyb-security-monitoring
+    newTag: placeholder-set-by-ci
+
+# 개발 환경에서 달라지는 설정값만 덮어씀
+patches:
+  - path: configmap-patch.yaml

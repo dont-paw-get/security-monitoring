@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: security-monitoring-config
+  labels:
+    app.kubernetes.io/name: security-monitoring
+# 민감하지 않은 설정값만 여기에 둡니다. CLIAR-252 시점에는 비밀값이
+# 전혀 없습니다(자체 DB/외부 API credential 없음) — Secret 은 아직
+# 만들지 않았습니다.
+data:
+  APP_ENV: "production"
+  APP_HOST: "0.0.0.0"
+  APP_PORT: "8000"
+
+  # ---- 관측 (app/core/logging_config.py, app/core/observability.py) ----
+  #
+  # 로그: 애플리케이션 stdout -> Grafana Alloy -> Loki.
+  LOG_LEVEL: "INFO"
+  LOG_FORMAT: "json"
+
+  # 트레이스: 애플리케이션 -> OTLP -> OpenTelemetry Collector -> Tempo.
+  # OTEL_EXPORTER_OTLP_ENDPOINT 는 환경마다 collector 주소가 다르므로
+  # base 에 두지 않고 overlay 에서만 주입한다. 이 값이 없으면 tracing이
+  # 켜지지 않는다(연결 실패 로그를 반복해서 남기지 않기 위한 의도된 동작).
+  OTEL_SERVICE_NAME: "security-monitoring"
+
+  # CLIAR-252: 실제 탐지 로직이 없는 lifecycle 골격만 있으므로 기본값은
+  # false다(app/services/monitoring_worker.py).
+  MONITORING_ENABLED: "false"

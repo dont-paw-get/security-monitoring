@@ -1,0 +1,34 @@
+name: PR Convention Check
+on:
+  pull_request:
+    types: [opened, edited, synchronize]
+jobs:
+  check-pr-format:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. PR 제목 검사 (기존 유지)
+      - name: Check PR Title Format
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          REGEX="^(feat|fix|docs|style|refactor|test|chore)(\([a-zA-Z0-9_-]+\))?: \[CLIAR-[0-9]+\] .+$"
+          if [[ ! "$TITLE" =~ $REGEX ]]; then
+            echo "❌ PR 제목이 커밋 컨벤션에 맞지 않습니다!"
+            exit 1
+          fi
+      # 2. PR 본문 검사 (신규 추가!)
+      - name: Check PR Body Content
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          # 템플릿의 기본 플레이스홀더(CLIAR-000)를 수정하지 않고 그대로 올렸는지 검사
+          if [[ "$BODY" == *"CLIAR-000"* ]]; then
+            echo "❌ PR 본문의 지라 티켓 번호(CLIAR-000)를 실제 작업한 번호로 변경해 주세요!"
+            exit 1
+          fi
+          # 내용이 너무 짧은지(10자 이하) 검사하여 대충 쓰는 것 방지
+          if [[ ${#BODY} -lt 10 ]]; then
+            echo "❌ PR 본문 내용이 너무 짧거나 비어있습니다. 템플릿에 맞춰 성의껏 작성해 주세요!"
+            exit 1
+          fi
+          echo "✅ PR 제목과 본문 형식이 모두 완벽합니다!"

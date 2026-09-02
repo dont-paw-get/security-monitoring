@@ -1,0 +1,115 @@
+name: Build & Push to ECR
+
+on:
+  push:
+    branches:
+      - develop         # develop → dev 환경
+      - main            # main → prod 환경
+    paths-ignore:
+      - "k8s/**"         # 태그 갱신 커밋이 무한루프 도는 것 방지
+      - "argocd/**"
+      - "docs/**"
+      - "**/*.md"
+  workflow_dispatch: {}  # 수동 실행도 허용
+
+permissions:
+  contents: write        # 매니페스트 이미지 태그 갱신 커밋을 위해
+
+env:
+  AWS_REGION: ap-northeast-2
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # 멀티아키(linux/amd64 + linux/arm64) 빌드를 위한 준비.
+      # prod 클러스터는 노드가 전부 arm64(Graviton) 이고 dev 는 amd64/arm64 가
+      # 섞여 있는데, NodePool 에 아키텍처 제약이 없어 Karpenter 가 어느 쪽이든
+      # 띄울 수 있습니다. 단일 아키 이미지는 pull 은 성공하고 실행 시점에
+      # "exec format error" 로 죽으므로 두 아키를 모두 빌드해야 합니다.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 브랜치별로 대상 ECR 리포/overlay/환경명을 결정합니다.
+      #   develop → dev  (dpyb-dev/dpyb-security-monitoring,  MUTABLE  → <branch>-latest 등 movable 태그 OK)
+      #   main    → prod (dpyb-prod/dpyb-security-monitoring, IMMUTABLE → 커밋 SHA 태그만 push)
+      # push 할 태그도 여기서 전부 계산합니다. buildx 멀티플랫폼 빌드는 결과를
+      # 로컬 데몬에 남기지 않아 나중에 `docker tag` 로 태그를 덧붙일 수 없고,
+      # 빌드 시점에 태그 목록을 전부 넘겨야 하기 때문입니다.
+      - name: Resolve target by branch
+        id: target
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$REF_NAME" = "main" ]; then
+            ENV_NAME=prod; ECR_REPOSITORY=dpyb-prod/dpyb-security-monitoring
+            OVERLAY=k8s/overlays/prod/kustomization.yaml; IMMUTABLE=true
+          else
+            ENV_NAME=dev;  ECR_REPOSITORY=dpyb-dev/dpyb-security-monitoring
+            OVERLAY=k8s/overlays/dev/kustomization.yaml;  IMMUTABLE=false
+          fi
+          {
+            echo "env=${ENV_NAME}"
+            echo "ecr_repository=${ECR_REPOSITORY}"
+            echo "overlay=${OVERLAY}"
+            echo "immutable=${IMMUTABLE}"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "tags<<TAGS_EOF"
+            echo "${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+            if [ "$IMMUTABLE" != "true" ]; then
+              echo "${REGISTRY}/${ECR_REPOSITORY}:${REF_NAME}-latest"
+            fi
+            echo "TAGS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # 태그 목록은 target 스텝이 계산합니다. 커밋 SHA 태그는 항상 포함되고,
+      # movable 태그(<branch>-latest)는 MUTABLE 리포(dev)에서만 붙습니다 —
+      # IMMUTABLE 리포(prod)는 같은 태그 재push 가 실패하기 때문입니다.
+      # provenance: false — attestation 매니페스트가 붙으면 ECR 콘솔과 일부
+      # 툴에서 unknown/unknown 아키텍처 항목으로 보입니다.
+      - name: Build & push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.target.outputs.tags }}
+          provenance: false
+
+      - name: Bump overlay image tag (GitOps)
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          KFILE: ${{ steps.target.outputs.overlay }}
+          ENV_NAME: ${{ steps.target.outputs.env }}
+        run: |
+          # kustomization.yaml 의 newTag 값을 커밋 SHA 로 치환
+          sed -i -E "s/^(\s*newTag:).*/\1 ${IMAGE_TAG}/" "$KFILE"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet "$KFILE"; then
+            echo "이미지 태그 변경 없음"
+          else
+            git add "$KFILE"
+            git commit -m "chore(deploy): bump ${ENV_NAME} image tag to ${IMAGE_TAG}"
+            git push origin "HEAD:${{ github.ref_name }}"
+          fi
