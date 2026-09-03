@@ -1,5 +1,5 @@
 """
-CLIAR-259: GuardDuty SQS Consumer.
+CLIAR-259/264: GuardDuty SQS Consumer + Bedrock AI 분석.
 
 MONITORING_ENABLED=false(기본값, app/core/config.py)면 아무 것도 하지
 않는다 — 앱은 워커 없이도 정상 기동/종료된다(boto3 client 생성/AWS API
@@ -7,16 +7,19 @@ MONITORING_ENABLED=false(기본값, app/core/config.py)면 아무 것도 하지
 polling으로 소비한다:
 
     receive -> Body JSON parse -> GuardDuty Finding 정규화
+    -> Bedrock AI 분석(app/services/security_analysis.py) -> 응답 검증
     -> (성공) 구조화 로그 -> DeleteMessage
     -> (실패) 삭제하지 않음 -> VisibilityTimeout 후 재시도
        -> maxReceiveCount(5) 초과 시 큐의 기존 RedrivePolicy가 DLQ로 이동
 
+CLIAR-264 핵심 규칙: Bedrock 분석이 성공하고 응답이 스키마를 통과해야만
+"처리 성공"이며, 그때만 DeleteMessage를 호출한다. GuardDuty 파싱까지만
+성공하고 Bedrock 분석이 실패한 경우(AWS 오류/타임아웃/malformed 응답 등
+무엇이든)에도 메시지를 삭제하지 않는다 — 기존 재시도/DLQ 동작을 그대로
+따른다.
+
 이 코드는 DLQ로 직접 SendMessage하지 않는다 — SQS 자체의
 RedrivePolicy만 사용한다.
-
-이 티켓 범위: SQS Consumer + GuardDuty Finding Parser까지만. Bedrock
-분석/SNS 알림은 아직 구현하지 않는다 — 파싱/정규화가 성공하면 구조화
-로그를 남기는 것으로 "현재 단계의 처리 성공"을 정의한다(item 8).
 """
 
 import asyncio
@@ -26,6 +29,7 @@ import logging
 from app.core.config import settings
 from app.providers import sqs as sqs_provider
 from app.services.guardduty_parser import GuardDutyEventError, parse_guardduty_event
+from app.services.security_analysis import SecurityAnalysisError, analyze_finding
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +39,10 @@ logger = logging.getLogger(__name__)
 # 쓰는 짧은 재시도 대기이며, busy-loop를 막기 위한 것이다.
 _ERROR_BACKOFF_SECONDS = 5.0
 
-# 로그에 남길 GuardDuty Finding 필드(item 8): 이 다섯 개만 남기고, 원본
-# Finding 전체(JSON)나 title/description 등 그 외 필드는 로그에 넣지
-# 않는다.
+# 성공 로그에 남길 필드(item 15): finding_id/finding_type/severity/region/
+# sample은 Finding에서, risk_level은 분석 결과에서 가져온다. summary/
+# cause/impact/recommended_actions 등 AI 응답 본문은 로그에 남기지
+# 않는다(전체 AI 응답 무조건 로깅 금지).
 _LOGGED_FINDING_FIELDS = ("finding_id", "finding_type", "severity", "region", "sample")
 
 
@@ -111,7 +116,7 @@ class MonitoringWorker:
     async def _process_message(self, message: dict) -> None:
         """메시지 1건을 처리하고, 처리가 성공했을 때만 삭제한다(at-least-once)."""
         receipt_handle = message.get("ReceiptHandle")
-        success = self._handle_body(message.get("Body"))
+        success = await self._handle_body(message.get("Body"))
 
         if not success or not receipt_handle:
             return
@@ -126,12 +131,14 @@ class MonitoringWorker:
             # 추가하지 않는다(item 10).
             logger.warning("sqs delete_message failed", exc_info=True)
 
-    def _handle_body(self, body: str | None) -> bool:
-        """SQS 메시지 Body(JSON 문자열)를 파싱/정규화하고 성공 시 구조화 로그를 남긴다.
+    async def _handle_body(self, body: str | None) -> bool:
+        """SQS 메시지 Body(JSON 문자열)를 파싱하고 Bedrock으로 분석한다.
 
         Returns:
-            처리 성공 여부. False면 호출부가 메시지를 삭제하지 않는다
-            (JSON parsing 실패, GuardDuty 이벤트 구조 오류 모두 포함).
+            처리 성공 여부. False면 호출부가 메시지를 삭제하지 않는다 —
+            JSON parsing 실패, GuardDuty 이벤트 구조 오류, Bedrock 호출
+            실패, AI 응답 검증 실패를 모두 포함한다(CLIAR-264: Bedrock
+            분석까지 성공해야 처리 성공이다).
         """
         if body is None:
             logger.warning("sqs message has no body")
@@ -149,10 +156,29 @@ class MonitoringWorker:
             logger.warning("guardduty event is malformed: %s", exc)
             return False
 
+        try:
+            analysis = await asyncio.to_thread(analyze_finding, finding)
+        except SecurityAnalysisError as exc:
+            # 원본 GuardDuty 이벤트나 Bedrock 요청/응답 전문은 로그에
+            # 남기지 않는다 — finding_id/finding_type/오류 범주만 남긴다
+            # (item 14). 메시지는 삭제하지 않고 기존 재시도/DLQ에 맡긴다.
+            logger.warning(
+                "guardduty finding bedrock analysis failed",
+                extra={
+                    "finding_id": finding.finding_id,
+                    "finding_type": finding.finding_type,
+                    "error_category": type(exc).__name__,
+                },
+            )
+            return False
+
         finding_fields = finding.model_dump()
         logger.info(
-            "guardduty finding processed",
-            extra={key: finding_fields[key] for key in _LOGGED_FINDING_FIELDS},
+            "guardduty finding analyzed",
+            extra={
+                **{key: finding_fields[key] for key in _LOGGED_FINDING_FIELDS},
+                "risk_level": analysis.risk_level.value,
+            },
         )
         return True
 
