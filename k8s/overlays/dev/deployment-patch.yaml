@@ -1,0 +1,24 @@
+# dev 환경 전용 — Pod template에 롤아웃 트리거용 annotation을 추가한다.
+# (CLIAR-260 후속: Runtime IAM/IRSA 및 DEV SQS 연동을 실제 Pod에 반영)
+#
+# 배경: ConfigMap 값(MONITORING_ENABLED 등)이나 ServiceAccount의
+# eks.amazonaws.com/role-arn annotation이 바뀌어도, 그 값들은
+# Deployment의 Pod template spec 자체를 바꾸지 않는다(envFrom으로
+# ConfigMap을 참조할 뿐이고, ServiceAccount는 이름으로만 참조한다).
+# 따라서 기존에 이미 떠 있는 Pod/ReplicaSet은 자동으로 재생성되지
+# 않는다.
+#
+# 이 annotation의 값을 바꾸는 것 자체가 Pod template을 변경시켜
+# ArgoCD Sync 시 새 ReplicaSet을 굴리는 GitOps 방식의 "재배포 트리거"다
+# (kubectl rollout restart 같은 클러스터 직접 조작 대신 Git 커밋으로
+# 처리). 값 자체는 의미 있는 설정이 아니라 회전 목적의 표식이다 —
+# 다음에 재배포가 필요하면 이 값만 갱신하면 된다.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: security-monitoring
+spec:
+  template:
+    metadata:
+      annotations:
+        dpyb.dev/runtime-config-revision: "cliar-260"
