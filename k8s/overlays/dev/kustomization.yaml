@@ -18,7 +18,7 @@ replicas:
 images:
   - name: security-monitoring
     newName: 594532711953.dkr.ecr.ap-northeast-2.amazonaws.com/dpyb-dev/dpyb-security-monitoring
-    newTag: bf75c0c231178d598e3f5a9907d7d7e3847256a6
+    newTag: f014e6d5b35558081397a58614433723918c69ab
 
 # 개발 환경에서 달라지는 설정값만 덮어씀
 patches:
