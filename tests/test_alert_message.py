@@ -2,7 +2,7 @@
 
 from app.schemas.guardduty import GuardDutyFinding
 from app.schemas.security_analysis import RiskLevel, SecurityAnalysis
-from app.services.alert_message import build_alert
+from app.services.alert_message import build_alert, build_discord_payload
 
 _FINDING = GuardDutyFinding(
     finding_id="finding-123",
@@ -67,3 +67,83 @@ def test_build_alert_caps_subject_length():
     subject, _ = build_alert(long_type_finding, _ANALYSIS)
 
     assert len(subject) <= 100
+
+
+# ---------------------------------------------------------------------------
+# build_discord_payload (CLIAR-271)
+# ---------------------------------------------------------------------------
+
+
+def test_build_discord_payload_includes_required_fields():
+    payload = build_discord_payload(_FINDING, _ANALYSIS)
+
+    embed = payload["embeds"][0]
+    assert "HIGH" in embed["title"]
+    assert _FINDING.finding_type in embed["title"]
+    assert embed["description"] == _ANALYSIS.summary
+
+    field_values = {field["name"]: field["value"] for field in embed["fields"]}
+    assert field_values["Finding ID"] == _FINDING.finding_id
+    assert field_values["위험도"] == "HIGH"
+    assert field_values["심각도"] == str(_FINDING.severity)
+    assert field_values["리전"] == _FINDING.region
+    assert field_values["원인"] == _ANALYSIS.cause
+    assert field_values["영향"] == _ANALYSIS.impact
+    for action in _ANALYSIS.recommended_actions:
+        assert action in field_values["권장 대응"]
+    assert field_values["Sample"] == "False"
+
+
+def test_build_discord_payload_sets_allowed_mentions_parse_empty():
+    payload = build_discord_payload(_FINDING, _ANALYSIS)
+
+    assert payload["allowed_mentions"] == {"parse": []}
+
+
+def test_build_discord_payload_allowed_mentions_survives_mention_like_content():
+    # title/description에 @everyone 등이 섞여 있어도 allowed_mentions는
+    # 항상 고정된 빈 parse 리스트여야 한다(payload 구조만으로도 실제
+    # 멘션이 발동하지 않도록 강제).
+    finding_with_mention_text = _FINDING.model_copy(
+        update={"title": "@everyone please look at this", "description": "<@123456789> ping"}
+    )
+
+    payload = build_discord_payload(finding_with_mention_text, _ANALYSIS)
+
+    assert payload["allowed_mentions"] == {"parse": []}
+
+
+def test_build_discord_payload_does_not_include_raw_event_or_credentials():
+    payload = build_discord_payload(_FINDING, _ANALYSIS)
+    serialized = str(payload)
+
+    for forbidden in ("additionalInfo", "accessKeyId", "detail-type", "AccessKey", "Credential"):
+        assert forbidden not in serialized
+
+
+def test_build_discord_payload_truncates_long_fields_without_extra_llm_call():
+    long_analysis = SecurityAnalysis(
+        risk_level=RiskLevel.CRITICAL,
+        summary="가" * 5000,
+        cause="나" * 5000,
+        impact="다" * 5000,
+        recommended_actions=["라" * 500],
+    )
+
+    payload = build_discord_payload(_FINDING, long_analysis)
+
+    embed = payload["embeds"][0]
+    assert len(embed["description"]) <= 2048
+    field_values = {field["name"]: field["value"] for field in embed["fields"]}
+    assert len(field_values["원인"]) <= 1024
+    assert len(field_values["영향"]) <= 1024
+    assert len(field_values["권장 대응"]) <= 1024
+
+
+def test_build_discord_payload_reflects_sample_flag():
+    sample_finding = _FINDING.model_copy(update={"sample": True})
+
+    payload = build_discord_payload(sample_finding, _ANALYSIS)
+
+    field_values = {field["name"]: field["value"] for field in payload["embeds"][0]["fields"]}
+    assert field_values["Sample"] == "True"

@@ -1,15 +1,16 @@
 # security-monitoring
 
 Virtual Shelf AWS 계정의 GuardDuty 보안 위협 탐지를 Bedrock으로 분석하고,
-검증된 분석 결과를 SNS로 관리자에게 알리는 보안관제 MSA입니다.
+검증된 분석 결과를 Discord(Primary) 또는 SNS 이메일(Fallback)로
+관리자에게 알리는 보안관제 MSA입니다.
 
 ## 프로젝트 목적
 
 AWS GuardDuty가 계정 전체에서 탐지한 보안 위협(Finding)을 사람이 바로
 읽을 수 있는 한국어 분석(원인/영향/권장 대응)으로 변환해 관리자에게
-이메일로 전달합니다. 이 서비스는 탐지(GuardDuty)나 알림 전송(SNS)을
+전달합니다. 이 서비스는 탐지(GuardDuty)나 알림 채널(Discord/SNS)을
 직접 만들지 않고, 그 사이에서 **Finding 정규화 → AI 분석 →
-검증 → 알림 발행**을 오케스트레이션합니다.
+검증 → 알림 발행(Discord 우선, 실패 시 SNS)**을 오케스트레이션합니다.
 
 ## 전체 아키텍처
 
@@ -32,14 +33,17 @@ Amazon Bedrock (Claude Haiku 4.5, Converse API)
   ▼
 AI 응답 검증 (JSON decode → Pydantic 스키마 검증)
   ▼
-Amazon SNS (dpyb-security-monitoring-alerts-dev)
-  ▼
-관리자 이메일 구독
-  ▼
-SQS DeleteMessage (여기까지 전부 성공했을 때만)
+Discord Webhook (Primary, DISCORD_WEBHOOK_URL 설정된 경우만)
+  │ 성공 → SNS는 호출하지 않음(중복 알림 방지) ──────────┐
+  │ 실패 또는 미설정                                       │
+  ▼                                                        │
+Amazon SNS (dpyb-security-monitoring-alerts-dev, Fallback) │
+  │ 관리자 이메일 구독                                      │
+  ▼                                                        ▼
+SQS DeleteMessage (Discord 또는 SNS 중 하나라도 성공했을 때만)
 ```
 
-## 각 AWS 서비스 역할
+## 각 서비스 역할
 
 | 서비스 | 역할 |
 | --- | --- |
@@ -48,8 +52,9 @@ SQS DeleteMessage (여기까지 전부 성공했을 때만)
 | SQS | security-monitoring이 안정적으로 처리할 수 있도록 Finding을 버퍼링 |
 | DLQ | 반복 실패한 메시지를 격리(최대 5회 재시도 후 자동 이동) |
 | Bedrock | 위험 원인/영향/대응 권고를 한국어로 분석 (자동 대응 없음) |
-| SNS | 검증된 분석 결과를 관리자 이메일로 발행 |
-| IRSA | Pod가 Static AWS Credential 없이 위 AWS API를 사용하도록 인증 |
+| Discord (AWS 서비스 아님) | 검증된 분석 결과를 관리자 채널에 우선 발행(Primary). 미설정/실패 시 SNS로 대체 |
+| SNS | Discord가 없거나 실패했을 때 관리자 이메일로 발행(Fallback) |
+| IRSA | Pod가 Static AWS Credential 없이 SQS/Bedrock/SNS API를 사용하도록 인증 |
 
 ## security-monitoring의 역할
 
@@ -71,12 +76,18 @@ Finding 하나마다 아래 "처리 순서"를 순서대로 실행합니다.
    `app/providers/bedrock.py`)
 4. AI 응답 JSON 디코드 + Pydantic 스키마 검증, `risk_level`은 severity
    기반으로 코드에서 재계산
-5. 관리자 알림 텍스트 구성 (`app/services/alert_message.py`)
-6. SNS Publish (`app/providers/sns.py`)
-7. 위 전체가 성공한 경우에만 SQS `DeleteMessage`
+5. `DISCORD_WEBHOOK_URL`이 설정되어 있으면 Discord Webhook 발행 시도
+   (`app/services/alert_message.py`의 `build_discord_payload`,
+   `app/providers/discord.py`)
+   - 성공하면 SNS는 호출하지 않습니다(중복 알림 방지).
+   - 실패하거나 애초에 설정되어 있지 않으면 6번으로 진행합니다.
+6. SNS Publish로 관리자 이메일 알림(Fallback) —
+   `build_alert` + `app/providers/sns.py`
+7. 위(5 또는 6) 중 하나라도 성공한 경우에만 SQS `DeleteMessage`
 
-boto3 호출(SQS/Bedrock/SNS)은 모두 동기(synchronous)이므로,
-`asyncio.to_thread`로 감싸 FastAPI/asyncio 이벤트 루프를 막지 않습니다.
+boto3 호출(SQS/Bedrock/SNS)과 Discord Webhook HTTP 호출은 모두
+동기(synchronous)이므로, `asyncio.to_thread`로 감싸 FastAPI/asyncio
+이벤트 루프를 막지 않습니다.
 
 ## 프로젝트 디렉터리 구조
 
@@ -90,21 +101,22 @@ app/
 │   ├── logging_config.py  # stdout JSON 구조화 로깅
 │   ├── metrics.py         # Prometheus HTTP 메트릭 미들웨어
 │   └── observability.py   # OpenTelemetry 분산 추적 설정
-├── providers/       # AWS SDK(boto3) client 래퍼 — 각 client 생성 + 단일 API 호출만 담당
-│   ├── bedrock.py       # bedrock-runtime, Converse
-│   ├── sns.py            # sns.publish
-│   └── sqs.py             # receive_message / delete_message
+├── providers/       # 외부 API client 래퍼 — 각 client 생성 + 단일 API 호출만 담당
+│   ├── bedrock.py       # boto3 bedrock-runtime, Converse
+│   ├── discord.py        # httpx, Discord Incoming Webhook POST
+│   ├── sns.py             # boto3 sns.publish
+│   └── sqs.py              # boto3 receive_message / delete_message
 ├── schemas/         # Pydantic 모델
 │   ├── guardduty.py            # GuardDutyFinding
 │   └── security_analysis.py    # AIAnalysisContent / SecurityAnalysis / RiskLevel
 ├── services/        # 비즈니스 로직 오케스트레이션
-│   ├── alert_message.py     # SecurityAnalysis + GuardDutyFinding -> 알림 텍스트
+│   ├── alert_message.py     # SecurityAnalysis + GuardDutyFinding -> SNS 텍스트 / Discord embed
 │   ├── guardduty_parser.py  # EventBridge 이벤트 -> GuardDutyFinding
-│   ├── monitoring_worker.py # SQS Consumer lifecycle + 전체 처리 순서
+│   ├── monitoring_worker.py # SQS Consumer lifecycle + 전체 처리 순서(Discord Primary/SNS Fallback 포함)
 │   └── security_analysis.py # Bedrock 프롬프트 구성 + 응답 검증 + risk_level 계산
 └── main.py           # FastAPI app, lifespan에서 monitoring_worker 시작/종료
 
-tests/                # pytest 단위 테스트 — 실제 AWS를 호출하지 않고 mock/monkeypatch만 사용
+tests/                # pytest 단위 테스트 — 실제 AWS/Discord를 호출하지 않고 mock/monkeypatch만 사용
 k8s/                  # Kustomize base + overlays(dev, prod)
 argocd/               # ArgoCD Application 매니페스트(dev, prod)
 .github/workflows/    # CI — ECR 빌드/푸시, PR 컨벤션 체크
@@ -127,11 +139,16 @@ AWS 인증은 IRSA(Static Credential 없음)로 이뤄집니다.
 | `SQS_GUARDDUTY_QUEUE_URL` | (없음) | GuardDuty Finding이 도착하는 SQS 큐 URL |
 | `BEDROCK_REGION` | `ap-northeast-2` | Bedrock Runtime 호출 리전 |
 | `BEDROCK_MODEL_ID` | `global.anthropic.claude-haiku-4-5-20251001-v1:0` | Bedrock Converse에 쓸 모델/Inference Profile ID |
-| `SNS_ALERT_TOPIC_ARN` | (없음) | 관리자 알림을 발행할 SNS Topic ARN |
+| `SNS_ALERT_TOPIC_ARN` | (없음) | 관리자 알림을 발행할 SNS Topic ARN(Fallback 채널, 필수) |
+| `DISCORD_WEBHOOK_URL` | (없음) | 관리자 알림을 우선 발행할 Discord Incoming Webhook URL(Primary 채널, 선택) |
 
 `MONITORING_ENABLED=true`인데 `SQS_GUARDDUTY_QUEUE_URL` 또는
 `SNS_ALERT_TOPIC_ARN`이 비어 있으면, 워커는 에러 로그만 남기고 polling을
-시작하지 않습니다(애플리케이션 자체는 정상 기동).
+시작하지 않습니다(애플리케이션 자체는 정상 기동). `DISCORD_WEBHOOK_URL`은
+필수가 아닙니다 — 비어 있으면 worker는 정상 시작하고 모든 알림을 SNS로만
+보냅니다. `DISCORD_WEBHOOK_URL`은 Secret이므로 `.env`/K8s ConfigMap 등
+평문 설정 파일에 실제 값을 커밋하지 않습니다 — 준비되면 K8s Secret으로
+주입합니다(아직 이 저장소에 Secret 매니페스트는 없습니다).
 
 `OTEL_SERVICE_NAME` / `OTEL_EXPORTER_OTLP_ENDPOINT` /
 `OTEL_RESOURCE_ATTRIBUTES` 등 OpenTelemetry 표준 환경변수는
@@ -179,8 +196,8 @@ GET http://127.0.0.1:8000/metrics
 
 ## 테스트
 
-실제 AWS를 호출하지 않습니다 — `app/providers/*`의 boto3 호출 지점을
-`monkeypatch`로 대체합니다.
+실제 AWS/Discord를 호출하지 않습니다 — `app/providers/*`의 boto3/httpx
+호출 지점을 `monkeypatch`로 대체합니다.
 
 ```powershell
 pytest -q
@@ -190,9 +207,9 @@ python -m compileall app
 주요 테스트 파일:
 
 - `tests/test_guardduty_parser.py` — EventBridge 이벤트 파싱
-- `tests/test_sqs_provider.py`, `tests/test_monitoring_worker.py` — SQS 소비/재시도/DLQ, 전체 처리 순서
+- `tests/test_sqs_provider.py`, `tests/test_monitoring_worker.py` — SQS 소비/재시도/DLQ, Discord Primary/SNS Fallback 전체 처리 순서
 - `tests/test_bedrock_provider.py`, `tests/test_security_analysis.py` — Bedrock 호출, 프롬프트, 응답 검증, `risk_level` 계산
-- `tests/test_sns_provider.py`, `tests/test_alert_message.py` — SNS Publish, 알림 텍스트 구성
+- `tests/test_sns_provider.py`, `tests/test_discord_provider.py`, `tests/test_alert_message.py` — SNS Publish, Discord Webhook Publish, 알림 텍스트/embed 구성
 - `tests/test_health.py`, `tests/test_metrics.py` — 기본 HTTP 엔드포인트
 
 ## DEV 배포
@@ -216,7 +233,10 @@ Runtime Pod는 `security-monitoring` ServiceAccount를 통해 IRSA Role
 - SNS/KMS: 위 SNS Topic 하나에 대한 `Publish`, 그 Topic의 SSE-KMS 키
   (`alias/aws/sns`) 하나에 대한 `kms:GenerateDataKey*` / `kms:Decrypt`
 
-Static AWS Credential은 어디에도 없습니다.
+Static AWS Credential은 어디에도 없습니다. Discord Webhook 호출은 AWS API가
+아니라 일반 HTTPS POST이므로 IAM 권한과 무관하며, 현재 DEV에는 실제
+Webhook URL이 아직 준비되어 있지 않습니다(아래 "Discord 통합 상태"
+참고).
 
 DEV `ConfigMap`(`k8s/overlays/dev/configmap-patch.yaml`)이 실제로 켜는
 값: `MONITORING_ENABLED=true`, `SQS_GUARDDUTY_QUEUE_URL`,
@@ -226,18 +246,22 @@ DEV `ConfigMap`(`k8s/overlays/dev/configmap-patch.yaml`)이 실제로 켜는
 
 ## 실패 / 재시도 / DLQ
 
-"처리 순서" 7단계 중 어느 하나라도 실패하면(파싱 오류, Bedrock 호출
-실패/타임아웃/응답 검증 실패, SNS Publish 실패 등 무엇이든) 메시지를
-삭제하지 않습니다. 이 코드는 DLQ로 직접 메시지를 보내지 않습니다 — SQS
-큐에 이미 설정된 동작만 사용합니다.
+"처리 순서" 단계 중 어느 하나라도 실패하면(파싱 오류, Bedrock 호출
+실패/타임아웃/응답 검증 실패, Discord와 SNS 모두 Publish 실패 등
+무엇이든) 메시지를 삭제하지 않습니다. 이 코드는 DLQ로 직접 메시지를
+보내지 않습니다 — SQS 큐에 이미 설정된 동작만 사용합니다.
 
 - 삭제되지 않은 메시지는 VisibilityTimeout(300초) 이후 자동으로
   재수신됩니다.
 - 같은 메시지가 `maxReceiveCount`(5회)를 초과해 실패하면, 큐의
   RedrivePolicy에 따라 `dpyb-security-monitoring-guardduty-dlq-dev`로
   자동 이동합니다.
-- Bedrock/SNS 오류 1건이 워커 프로세스 전체를 종료시키지 않습니다 —
-  다음 메시지 처리로 넘어갑니다.
+- Bedrock/Discord/SNS 오류 1건이 워커 프로세스 전체를 종료시키지
+  않습니다 — 다음 메시지 처리로 넘어갑니다.
+- Discord Publish가 실패(timeout/network 오류/4xx/5xx/429 등 무엇이든)
+  하면 즉시 SNS로 fallback합니다 — 둘 다 실패했을 때만 메시지를
+  삭제하지 않습니다. Discord가 성공하면 SNS는 호출하지 않습니다(중복
+  알림 방지).
 - `sample=true`(GuardDuty Sample Finding)도 건너뛰지 않고 동일하게
   전체 파이프라인을 통과합니다.
 
@@ -246,10 +270,15 @@ DEV `ConfigMap`(`k8s/overlays/dev/configmap-patch.yaml`)이 실제로 켜는
 - Static AWS Credential을 어디에도 두지 않고, IRSA만 사용합니다.
 - IAM 권한은 서비스별/리소스별 최소권한으로 스코핑되어 있습니다.
 - GuardDuty 원본 EventBridge 이벤트 전체나 `service.additionalInfo`
-  원문을 Bedrock/SNS로 보내지 않습니다 — 정규화된 최소 필드만 사용합니다.
-- Credential/Token/Access Key는 로그에 남기지 않습니다. 실패 로그에는
-  `finding_id` / `finding_type` / 오류 범주만 남기고, 성공 로그에도
-  분석·알림 본문 전체는 남기지 않습니다.
+  원문을 Bedrock/Discord/SNS로 보내지 않습니다 — 정규화된 최소 필드만
+  사용합니다.
+- Credential/Token/Access Key/`DISCORD_WEBHOOK_URL`은 로그에 남기지
+  않습니다. 실패 로그에는 `finding_id` / `finding_type` / 오류 범주만
+  남기고, 성공 로그에도 분석·알림 본문 전체는 남기지 않습니다.
+- Discord Webhook payload에는 항상 `allowed_mentions.parse: []`를
+  고정으로 넣습니다 — GuardDuty Finding의 title/description처럼 외부에서
+  흘러들어온 문자열에 `@everyone`/`@here`/사용자 멘션이 섞여 있어도 실제
+  멘션이 발생하지 않도록 payload 구조 자체로 차단합니다.
 - Bedrock은 분석/권고 텍스트만 생성합니다 — `risk_level`은 LLM 출력이
   아니라 GuardDuty의 공식 `severity`로부터 애플리케이션 코드가
   결정적으로 계산합니다(아래 매핑). 같은 severity는 항상 같은
@@ -290,6 +319,19 @@ GuardDuty Sample Finding 생성
 확인된 Pod 상태: Running / Ready / Restart 0. 기존 서비스
 (`backend-auth`, `backend-record`, `backend-book`)에 대한 회귀는
 확인되지 않았습니다.
+
+위 E2E는 SNS 알림 경로 기준입니다(당시 Discord는 아직 없었습니다).
+
+### Discord 통합 상태
+
+Discord Primary/SNS Fallback 로직(`app/providers/discord.py`,
+`app/services/alert_message.py`의 `build_discord_payload`,
+`app/services/monitoring_worker.py`)은 **코드 구현 및 단위 테스트까지
+완료**되었습니다(`DISCORD_WEBHOOK_URL` 미설정 시 SNS만 쓰는 경로 포함).
+다만 실제 Discord 채널/Webhook이 아직 준비되지 않아 **실제 DEV
+Webhook으로의 E2E(POST 성공, 채널에 메시지 도착 확인)는 아직
+수행되지 않았습니다.** Webhook이 준비되면 K8s Secret으로 URL을
+주입한 뒤 별도로 검증합니다.
 
 ## 현재 구현하지 않는 것
 
