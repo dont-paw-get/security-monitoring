@@ -23,3 +23,5 @@ images:
 # 개발 환경에서 달라지는 설정값만 덮어씀
 patches:
   - path: configmap-patch.yaml
+  # IRSA 롤 ARN 주입 (CLIAR-260, dpyb-security-monitoring-irsa-dev 생성 완료)
+  - path: serviceaccount-patch.yaml
