@@ -25,3 +25,6 @@ patches:
   - path: configmap-patch.yaml
   # IRSA 롤 ARN 주입 (CLIAR-260, dpyb-security-monitoring-irsa-dev 생성 완료)
   - path: serviceaccount-patch.yaml
+  # ConfigMap/ServiceAccount 변경만으로는 기존 Pod가 재생성되지 않으므로,
+  # Pod template annotation을 바꿔 새 ReplicaSet을 트리거한다 (CLIAR-260 후속)
+  - path: deployment-patch.yaml
