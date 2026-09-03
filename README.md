@@ -52,9 +52,10 @@ SQS DeleteMessage (Discord 또는 SNS 중 하나라도 성공했을 때만)
 | SQS | security-monitoring이 안정적으로 처리할 수 있도록 Finding을 버퍼링 |
 | DLQ | 반복 실패한 메시지를 격리(최대 5회 재시도 후 자동 이동) |
 | Bedrock | 위험 원인/영향/대응 권고를 한국어로 분석 (자동 대응 없음) |
+| Secrets Manager | Discord Webhook URL을 Pod startup 시점에 안전하게 조회(값 자체는 K8s에 두지 않음) |
 | Discord (AWS 서비스 아님) | 검증된 분석 결과를 관리자 채널에 우선 발행(Primary). 미설정/실패 시 SNS로 대체 |
 | SNS | Discord가 없거나 실패했을 때 관리자 이메일로 발행(Fallback) |
-| IRSA | Pod가 Static AWS Credential 없이 SQS/Bedrock/SNS API를 사용하도록 인증 |
+| IRSA | Pod가 Static AWS Credential 없이 SQS/Bedrock/SNS/Secrets Manager API를 사용하도록 인증 |
 
 ## security-monitoring의 역할
 
@@ -76,9 +77,11 @@ Finding 하나마다 아래 "처리 순서"를 순서대로 실행합니다.
    `app/providers/bedrock.py`)
 4. AI 응답 JSON 디코드 + Pydantic 스키마 검증, `risk_level`은 severity
    기반으로 코드에서 재계산
-5. `DISCORD_WEBHOOK_URL`이 설정되어 있으면 Discord Webhook 발행 시도
-   (`app/services/alert_message.py`의 `build_discord_payload`,
-   `app/providers/discord.py`)
+5. Discord Webhook URL을 확인한다(Pod startup 시점에 1회만 조회하고
+   캐싱 — `DISCORD_WEBHOOK_URL` 직접 지정 또는 `DISCORD_WEBHOOK_SECRET_ID`로
+   AWS Secrets Manager 조회, `app/providers/secrets_manager.py`). URL이
+   있으면 Discord Webhook 발행을 시도한다(`app/services/alert_message.py`의
+   `build_discord_payload`, `app/providers/discord.py`)
    - 성공하면 SNS는 호출하지 않습니다(중복 알림 방지).
    - 실패하거나 애초에 설정되어 있지 않으면 6번으로 진행합니다.
 6. SNS Publish로 관리자 이메일 알림(Fallback) —
@@ -102,10 +105,11 @@ app/
 │   ├── metrics.py         # Prometheus HTTP 메트릭 미들웨어
 │   └── observability.py   # OpenTelemetry 분산 추적 설정
 ├── providers/       # 외부 API client 래퍼 — 각 client 생성 + 단일 API 호출만 담당
-│   ├── bedrock.py       # boto3 bedrock-runtime, Converse
-│   ├── discord.py        # httpx, Discord Incoming Webhook POST
-│   ├── sns.py             # boto3 sns.publish
-│   └── sqs.py              # boto3 receive_message / delete_message
+│   ├── bedrock.py         # boto3 bedrock-runtime, Converse
+│   ├── discord.py          # httpx, Discord Incoming Webhook POST
+│   ├── secrets_manager.py  # boto3 secretsmanager, GetSecretValue
+│   ├── sns.py               # boto3 sns.publish
+│   └── sqs.py                # boto3 receive_message / delete_message
 ├── schemas/         # Pydantic 모델
 │   ├── guardduty.py            # GuardDutyFinding
 │   └── security_analysis.py    # AIAnalysisContent / SecurityAnalysis / RiskLevel
@@ -140,15 +144,19 @@ AWS 인증은 IRSA(Static Credential 없음)로 이뤄집니다.
 | `BEDROCK_REGION` | `ap-northeast-2` | Bedrock Runtime 호출 리전 |
 | `BEDROCK_MODEL_ID` | `global.anthropic.claude-haiku-4-5-20251001-v1:0` | Bedrock Converse에 쓸 모델/Inference Profile ID |
 | `SNS_ALERT_TOPIC_ARN` | (없음) | 관리자 알림을 발행할 SNS Topic ARN(Fallback 채널, 필수) |
-| `DISCORD_WEBHOOK_URL` | (없음) | 관리자 알림을 우선 발행할 Discord Incoming Webhook URL(Primary 채널, 선택) |
+| `DISCORD_WEBHOOK_URL` | (없음) | Discord Incoming Webhook URL 직접 지정(로컬 개발/테스트 override 전용, DEV/PROD K8s에는 두지 않음) |
+| `DISCORD_WEBHOOK_SECRET_ID` | (없음) | `DISCORD_WEBHOOK_URL`이 없을 때 AWS Secrets Manager에서 Webhook URL을 조회할 Secret 이름(Primary 채널, 선택) |
 
 `MONITORING_ENABLED=true`인데 `SQS_GUARDDUTY_QUEUE_URL` 또는
 `SNS_ALERT_TOPIC_ARN`이 비어 있으면, 워커는 에러 로그만 남기고 polling을
-시작하지 않습니다(애플리케이션 자체는 정상 기동). `DISCORD_WEBHOOK_URL`은
-필수가 아닙니다 — 비어 있으면 worker는 정상 시작하고 모든 알림을 SNS로만
-보냅니다. `DISCORD_WEBHOOK_URL`은 Secret이므로 `.env`/K8s ConfigMap 등
-평문 설정 파일에 실제 값을 커밋하지 않습니다 — 준비되면 K8s Secret으로
-주입합니다(아직 이 저장소에 Secret 매니페스트는 없습니다).
+시작하지 않습니다(애플리케이션 자체는 정상 기동). Discord 관련 두 값 모두
+필수가 아닙니다 — 둘 다 비어 있으면 worker는 정상 시작하고 모든 알림을
+SNS로만 보냅니다. Discord Webhook URL 자체는 Secret이므로 `.env`/K8s
+ConfigMap 등 평문 설정 파일에 실제 값을 커밋하지 않습니다 — DEV에서는
+`DISCORD_WEBHOOK_SECRET_ID`(Secret **이름**, 비밀 아님)만 ConfigMap에
+두고, 실제 URL 값은 AWS Secrets Manager에서 Pod startup 시점에 한 번만
+조회해 프로세스 메모리에만 유지합니다(`DISCORD_WEBHOOK_URL`은 로컬
+override 전용).
 
 `OTEL_SERVICE_NAME` / `OTEL_EXPORTER_OTLP_ENDPOINT` /
 `OTEL_RESOURCE_ATTRIBUTES` 등 OpenTelemetry 표준 환경변수는
@@ -209,7 +217,7 @@ python -m compileall app
 - `tests/test_guardduty_parser.py` — EventBridge 이벤트 파싱
 - `tests/test_sqs_provider.py`, `tests/test_monitoring_worker.py` — SQS 소비/재시도/DLQ, Discord Primary/SNS Fallback 전체 처리 순서
 - `tests/test_bedrock_provider.py`, `tests/test_security_analysis.py` — Bedrock 호출, 프롬프트, 응답 검증, `risk_level` 계산
-- `tests/test_sns_provider.py`, `tests/test_discord_provider.py`, `tests/test_alert_message.py` — SNS Publish, Discord Webhook Publish, 알림 텍스트/embed 구성
+- `tests/test_sns_provider.py`, `tests/test_discord_provider.py`, `tests/test_secrets_manager_provider.py`, `tests/test_alert_message.py` — SNS Publish, Discord Webhook Publish, Secrets Manager 조회, 알림 텍스트/embed 구성
 - `tests/test_health.py`, `tests/test_metrics.py` — 기본 HTTP 엔드포인트
 
 ## DEV 배포
@@ -232,10 +240,13 @@ Runtime Pod는 `security-monitoring` ServiceAccount를 통해 IRSA Role
   `GetInferenceProfile`
 - SNS/KMS: 위 SNS Topic 하나에 대한 `Publish`, 그 Topic의 SSE-KMS 키
   (`alias/aws/sns`) 하나에 대한 `kms:GenerateDataKey*` / `kms:Decrypt`
+- Secrets Manager: Discord Webhook URL을 담은 Secret 하나
+  (`dpgy-infra/security-monitoring-discord-webhook-dev`)에 대한
+  `secretsmanager:GetSecretValue`만
 
-Static AWS Credential은 어디에도 없습니다. Discord Webhook 호출은 AWS API가
-아니라 일반 HTTPS POST이므로 IAM 권한과 무관하며, 현재 DEV에는 실제
-Webhook URL이 아직 준비되어 있지 않습니다(아래 "Discord 통합 상태"
+Static AWS Credential은 어디에도 없습니다. Discord Webhook HTTP POST
+자체는 AWS API가 아니므로 IAM 권한과 무관하며, URL을 얻어오는 단계
+(Secrets Manager 조회)만 위 IRSA 권한을 씁니다(아래 "Discord 통합 상태"
 참고).
 
 DEV `ConfigMap`(`k8s/overlays/dev/configmap-patch.yaml`)이 실제로 켜는
@@ -326,12 +337,15 @@ GuardDuty Sample Finding 생성
 
 Discord Primary/SNS Fallback 로직(`app/providers/discord.py`,
 `app/services/alert_message.py`의 `build_discord_payload`,
-`app/services/monitoring_worker.py`)은 **코드 구현 및 단위 테스트까지
-완료**되었습니다(`DISCORD_WEBHOOK_URL` 미설정 시 SNS만 쓰는 경로 포함).
-다만 실제 Discord 채널/Webhook이 아직 준비되지 않아 **실제 DEV
-Webhook으로의 E2E(POST 성공, 채널에 메시지 도착 확인)는 아직
-수행되지 않았습니다.** Webhook이 준비되면 K8s Secret으로 URL을
-주입한 뒤 별도로 검증합니다.
+`app/services/monitoring_worker.py`)과, Webhook URL을 AWS Secrets
+Manager에서 조회하는 로직(`app/providers/secrets_manager.py`)은 모두
+**코드 구현 및 단위 테스트까지 완료**되었습니다(`DISCORD_WEBHOOK_URL`/
+`DISCORD_WEBHOOK_SECRET_ID` 둘 다 미설정 시 SNS만 쓰는 경로, Secret
+조회 실패 시 SNS로 자동 전환하는 경로 포함). 다만 실제 Discord
+채널/Webhook이 아직 준비되지 않아 **실제 DEV Webhook으로의
+E2E(Secrets Manager 조회 성공 → POST 성공 → 채널에 메시지 도착 확인)는
+아직 수행되지 않았습니다.** 실제 Webhook이 Secret에 채워지면 별도로
+검증합니다.
 
 ## 현재 구현하지 않는 것
 

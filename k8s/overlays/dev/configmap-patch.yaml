@@ -54,3 +54,12 @@ data:
   # Key 하나에 대한 kms:GenerateDataKey*/kms:Decrypt만 가지고 있다. 값
   # 자체는 비밀이 아니다.
   SNS_ALERT_TOPIC_ARN: "arn:aws:sns:ap-northeast-2:594532711953:dpyb-security-monitoring-alerts-dev"
+
+  # ---- Discord Webhook Secrets Manager 연동 (CLIAR-271, app/providers/secrets_manager.py) ----
+  #
+  # 이 값은 Secret의 "이름"일 뿐 실제 Webhook URL이 아니다 — URL 값
+  # 자체는 여기(또는 다른 어떤 K8s manifest)에도 두지 않는다. 위 IRSA
+  # 롤이 이 Secret ARN 하나에 대한 secretsmanager:GetSecretValue만
+  # 가지고 있다. DISCORD_WEBHOOK_URL은 이 ConfigMap에 의도적으로 두지
+  # 않는다(로컬 override 전용, 실제 DEV/PROD에서는 미사용).
+  DISCORD_WEBHOOK_SECRET_ID: "dpgy-infra/security-monitoring-discord-webhook-dev"

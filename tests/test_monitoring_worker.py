@@ -1,13 +1,14 @@
 """
 app/services/monitoring_worker.py 단위 테스트(CLIAR-259: GuardDuty SQS
 Consumer, CLIAR-264: Bedrock AI 분석 연동, CLIAR-268: SNS 관리자 알림
-연동, CLIAR-271: Discord Primary/SNS Fallback 연동).
+연동, CLIAR-271: Discord Primary/SNS Fallback + Secrets Manager 연동).
 
 실제 AWS/Discord를 호출하지 않는다 — app/providers/sqs.py의
 receive_messages/delete_message, app/services/monitoring_worker의
-analyze_finding, sns_provider.publish_alert, discord_provider.publish_alert를
-monkeypatch로 대체한다(backend-record의
-monkeypatch.setattr(s3_upload, "upload_scrap_image", ...) 패턴과 동일).
+analyze_finding, sns_provider.publish_alert, discord_provider.publish_alert,
+secrets_manager_provider.get_secret_value를 monkeypatch로 대체한다
+(backend-record의 monkeypatch.setattr(s3_upload, "upload_scrap_image", ...)
+패턴과 동일).
 """
 
 import json
@@ -18,6 +19,7 @@ from fastapi.testclient import TestClient
 from app.core.config import settings
 from app.main import app
 from app.providers import discord as discord_provider
+from app.providers import secrets_manager as secrets_manager_provider
 from app.providers import sns as sns_provider
 from app.providers import sqs as sqs_provider
 from app.schemas.security_analysis import RiskLevel, SecurityAnalysis
@@ -27,6 +29,7 @@ from app.services.security_analysis import SecurityAnalysisError
 
 SNS_ALERT_TOPIC_ARN = "arn:aws:sns:ap-northeast-2:594532711953:dpyb-security-monitoring-alerts-dev"
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1111111111/secret-token-should-not-be-logged"
+DISCORD_WEBHOOK_SECRET_ID = "dpgy-infra/security-monitoring-discord-webhook-dev"
 
 VALID_EVENT_BODY = json.dumps(
     {
@@ -88,8 +91,9 @@ def _patch_successful_sns_publish(monkeypatch, captured: dict | None = None, mes
 
 
 def _patch_successful_discord_publish(monkeypatch, captured: dict | None = None):
-    def fake_publish_alert(payload, client=None):
+    def fake_publish_alert(webhook_url, payload, client=None):
         if captured is not None:
+            captured["webhook_url"] = webhook_url
             captured["payload"] = payload
         return None
 
@@ -97,7 +101,7 @@ def _patch_successful_discord_publish(monkeypatch, captured: dict | None = None)
 
 
 def _patch_failing_discord_publish(monkeypatch, message: str = "Discord webhook returned HTTP 500"):
-    def raise_discord_error(payload, client=None):
+    def raise_discord_error(webhook_url, payload, client=None):
         raise discord_provider.DiscordPublishError(message)
 
     monkeypatch.setattr(discord_provider, "publish_alert", raise_discord_error)
@@ -110,16 +114,33 @@ def _patch_failing_sns_publish(monkeypatch, message: str = "SNS publish failed: 
     monkeypatch.setattr(sns_provider, "publish_alert", raise_sns_error)
 
 
+def _patch_successful_secret_lookup(monkeypatch, value: str = DISCORD_WEBHOOK_URL, call_count: dict | None = None):
+    def fake_get_secret_value(secret_id, client=None):
+        if call_count is not None:
+            call_count["value"] = call_count.get("value", 0) + 1
+        return value
+
+    monkeypatch.setattr(secrets_manager_provider, "get_secret_value", fake_get_secret_value)
+
+
+def _patch_failing_secret_lookup(monkeypatch, message: str = "Secrets Manager get_secret_value failed: AccessDeniedException"):
+    def raise_secret_error(secret_id, client=None):
+        raise secrets_manager_provider.SecretRetrievalError(message)
+
+    monkeypatch.setattr(secrets_manager_provider, "get_secret_value", raise_secret_error)
+
+
 def test_monitoring_enabled_defaults_to_false():
     assert settings.MONITORING_ENABLED is False
 
 
-def test_discord_webhook_url_defaults_to_none():
+def test_discord_webhook_url_and_secret_id_default_to_none():
     assert settings.DISCORD_WEBHOOK_URL is None
+    assert settings.DISCORD_WEBHOOK_SECRET_ID is None
 
 
 def test_app_starts_and_stops_normally_with_worker_disabled(monkeypatch):
-    """item 16: MONITORING_ENABLED=false(기본값) 상태에서 lifespan(startup/
+    """item 14: MONITORING_ENABLED=false(기본값) 상태에서 lifespan(startup/
     shutdown)이 예외 없이 정상적으로 열리고 닫히는지 확인한다. AWS 호출이
     전혀 없어야 하므로 receive_messages를 감시해 호출되지 않았음을
     확인한다."""
@@ -140,7 +161,7 @@ def test_app_starts_and_stops_normally_with_worker_disabled(monkeypatch):
 
 
 async def test_worker_start_is_noop_when_disabled(monkeypatch):
-    """item 16."""
+    """item 14."""
     worker = MonitoringWorker()
     monkeypatch.setattr("app.services.monitoring_worker.settings.MONITORING_ENABLED", False)
 
@@ -177,9 +198,9 @@ async def test_worker_does_not_start_when_sns_topic_arn_missing(monkeypatch):
     assert worker._task is None
 
 
-async def test_worker_starts_without_discord_webhook_configured(monkeypatch):
-    """CLIAR-271: DISCORD_WEBHOOK_URL이 없어도(현재 DEV 기본 상태) worker는
-    정상적으로 시작한다 — Discord는 필수가 아니다."""
+async def test_worker_starts_without_discord_configured_at_all(monkeypatch):
+    """DISCORD_WEBHOOK_URL/DISCORD_WEBHOOK_SECRET_ID 둘 다 없어도(현재 DEV
+    기본 상태) worker는 정상적으로 시작한다 — Discord는 필수가 아니다."""
     monkeypatch.setattr("app.services.monitoring_worker.settings.MONITORING_ENABLED", True)
     monkeypatch.setattr(
         "app.services.monitoring_worker.settings.SQS_GUARDDUTY_QUEUE_URL",
@@ -187,6 +208,7 @@ async def test_worker_starts_without_discord_webhook_configured(monkeypatch):
     )
     monkeypatch.setattr("app.services.monitoring_worker.settings.SNS_ALERT_TOPIC_ARN", SNS_ALERT_TOPIC_ARN)
     monkeypatch.setattr("app.services.monitoring_worker.settings.DISCORD_WEBHOOK_URL", None)
+    monkeypatch.setattr("app.services.monitoring_worker.settings.DISCORD_WEBHOOK_SECRET_ID", None)
     monkeypatch.setattr(sqs_provider, "receive_messages", lambda client=None: [])
 
     worker = MonitoringWorker(backoff_seconds=0.01)
@@ -196,7 +218,7 @@ async def test_worker_starts_without_discord_webhook_configured(monkeypatch):
 
 
 async def test_worker_start_creates_task_and_stop_cancels_it_cleanly(monkeypatch):
-    """item 15: graceful shutdown."""
+    """item 13: graceful shutdown."""
     monkeypatch.setattr("app.services.monitoring_worker.settings.MONITORING_ENABLED", True)
     monkeypatch.setattr(
         "app.services.monitoring_worker.settings.SQS_GUARDDUTY_QUEUE_URL",
@@ -217,14 +239,205 @@ async def test_worker_start_creates_task_and_stop_cancels_it_cleanly(monkeypatch
     assert worker._task is None
 
 
+async def test_worker_start_resolves_discord_webhook_from_secrets_manager_without_blocking(monkeypatch):
+    """Secrets Manager 조회가 AccessDenied로 실패해도 start()는 정상적으로
+    worker를 시작시킨다(item 4: Worker startup 유지)."""
+    monkeypatch.setattr("app.services.monitoring_worker.settings.MONITORING_ENABLED", True)
+    monkeypatch.setattr(
+        "app.services.monitoring_worker.settings.SQS_GUARDDUTY_QUEUE_URL",
+        "https://sqs.ap-northeast-2.amazonaws.com/594532711953/dpyb-security-monitoring-guardduty-dev",
+    )
+    monkeypatch.setattr("app.services.monitoring_worker.settings.SNS_ALERT_TOPIC_ARN", SNS_ALERT_TOPIC_ARN)
+    monkeypatch.setattr("app.services.monitoring_worker.settings.DISCORD_WEBHOOK_URL", None)
+    monkeypatch.setattr("app.services.monitoring_worker.settings.DISCORD_WEBHOOK_SECRET_ID", DISCORD_WEBHOOK_SECRET_ID)
+    monkeypatch.setattr(sqs_provider, "receive_messages", lambda client=None: [])
+    _patch_failing_secret_lookup(monkeypatch, message="Secrets Manager get_secret_value failed: AccessDeniedException")
+
+    worker = MonitoringWorker(backoff_seconds=0.01)
+    await worker.start()  # 예외 없이 시작되어야 한다
+
+    assert worker._task is not None
+    assert worker._discord_webhook_url is None  # Discord는 비활성화됨
+    await worker.stop()
+
+
 # ---------------------------------------------------------------------------
-# 알림 정책(CLIAR-271): Discord Primary -> 실패/미설정 시 SNS Fallback.
-# 어느 한쪽이든 성공해야 DeleteMessage, 둘 다 실패하면 삭제하지 않는다.
+# Secrets Manager를 통한 Discord Webhook URL 조회(CLIAR-271).
+# ---------------------------------------------------------------------------
+
+
+async def test_explicit_discord_webhook_url_skips_secrets_manager(monkeypatch):
+    """item 1: DISCORD_WEBHOOK_URL이 직접 설정되어 있으면 Secrets Manager를
+    호출하지 않고 그 값을 그대로 사용한다."""
+    monkeypatch.setattr(sqs_provider, "delete_message", lambda *a, **k: None)
+    monkeypatch.setattr("app.services.monitoring_worker.settings.DISCORD_WEBHOOK_URL", DISCORD_WEBHOOK_URL)
+    monkeypatch.setattr("app.services.monitoring_worker.settings.DISCORD_WEBHOOK_SECRET_ID", DISCORD_WEBHOOK_SECRET_ID)
+    _patch_successful_analysis(monkeypatch)
+
+    secret_called = {"value": False}
+    monkeypatch.setattr(
+        secrets_manager_provider, "get_secret_value", lambda *a, **k: secret_called.__setitem__("value", True)
+    )
+    captured: dict = {}
+    _patch_successful_discord_publish(monkeypatch, captured=captured)
+
+    worker = MonitoringWorker()
+    await worker._process_message({"Body": VALID_EVENT_BODY, "ReceiptHandle": "r-explicit-url"})
+
+    assert secret_called["value"] is False
+    assert captured["webhook_url"] == DISCORD_WEBHOOK_URL
+
+
+async def test_secret_id_resolves_webhook_url_and_passes_to_discord(monkeypatch):
+    """item 2: URL 미설정 + SECRET_ID 설정 -> GetSecretValue 1회 -> Discord
+    Provider에 URL 전달."""
+    monkeypatch.setattr(sqs_provider, "delete_message", lambda *a, **k: None)
+    monkeypatch.setattr("app.services.monitoring_worker.settings.DISCORD_WEBHOOK_URL", None)
+    monkeypatch.setattr("app.services.monitoring_worker.settings.DISCORD_WEBHOOK_SECRET_ID", DISCORD_WEBHOOK_SECRET_ID)
+    _patch_successful_analysis(monkeypatch)
+
+    call_count: dict = {}
+    _patch_successful_secret_lookup(monkeypatch, value=DISCORD_WEBHOOK_URL, call_count=call_count)
+    captured: dict = {}
+    _patch_successful_discord_publish(monkeypatch, captured=captured)
+
+    worker = MonitoringWorker()
+    await worker._process_message({"Body": VALID_EVENT_BODY, "ReceiptHandle": "r-secret-id"})
+
+    assert call_count["value"] == 1
+    assert captured["webhook_url"] == DISCORD_WEBHOOK_URL
+
+
+async def test_secret_lookup_happens_only_once_across_multiple_findings(monkeypatch):
+    """item 3: 같은 worker 인스턴스로 여러 Finding을 처리해도 GetSecretValue는
+    1회만 호출된다(메모리에 캐싱)."""
+    monkeypatch.setattr(sqs_provider, "delete_message", lambda *a, **k: None)
+    monkeypatch.setattr("app.services.monitoring_worker.settings.DISCORD_WEBHOOK_URL", None)
+    monkeypatch.setattr("app.services.monitoring_worker.settings.DISCORD_WEBHOOK_SECRET_ID", DISCORD_WEBHOOK_SECRET_ID)
+    _patch_successful_analysis(monkeypatch)
+
+    call_count: dict = {}
+    _patch_successful_secret_lookup(monkeypatch, value=DISCORD_WEBHOOK_URL, call_count=call_count)
+    _patch_successful_discord_publish(monkeypatch)
+
+    worker = MonitoringWorker()
+    await worker._process_message({"Body": VALID_EVENT_BODY, "ReceiptHandle": "r-1"})
+    await worker._process_message({"Body": VALID_EVENT_BODY, "ReceiptHandle": "r-2"})
+    await worker._process_message({"Body": VALID_EVENT_BODY, "ReceiptHandle": "r-3"})
+
+    assert call_count["value"] == 1
+
+
+async def test_secret_access_denied_falls_back_to_sns(monkeypatch):
+    """item 4: Secret 조회 AccessDenied -> SNS fallback."""
+    deleted = {}
+    monkeypatch.setattr(
+        sqs_provider, "delete_message", lambda receipt_handle, client=None: deleted.__setitem__("receipt_handle", receipt_handle)
+    )
+    monkeypatch.setattr("app.services.monitoring_worker.settings.DISCORD_WEBHOOK_URL", None)
+    monkeypatch.setattr("app.services.monitoring_worker.settings.DISCORD_WEBHOOK_SECRET_ID", DISCORD_WEBHOOK_SECRET_ID)
+    _patch_successful_analysis(monkeypatch)
+    _patch_failing_secret_lookup(monkeypatch, message="Secrets Manager get_secret_value failed: AccessDeniedException")
+
+    discord_called = {"value": False}
+    monkeypatch.setattr(
+        discord_provider, "publish_alert", lambda *a, **k: discord_called.__setitem__("value", True)
+    )
+    _patch_successful_sns_publish(monkeypatch)
+
+    worker = MonitoringWorker()
+    await worker._process_message({"Body": VALID_EVENT_BODY, "ReceiptHandle": "r-access-denied"})
+
+    assert discord_called["value"] is False
+    assert deleted["receipt_handle"] == "r-access-denied"
+
+
+async def test_secret_resource_not_found_falls_back_to_sns(monkeypatch):
+    """item 5: Secret ResourceNotFound -> SNS fallback."""
+    deleted = {}
+    monkeypatch.setattr(
+        sqs_provider, "delete_message", lambda receipt_handle, client=None: deleted.__setitem__("receipt_handle", receipt_handle)
+    )
+    monkeypatch.setattr("app.services.monitoring_worker.settings.DISCORD_WEBHOOK_URL", None)
+    monkeypatch.setattr("app.services.monitoring_worker.settings.DISCORD_WEBHOOK_SECRET_ID", DISCORD_WEBHOOK_SECRET_ID)
+    _patch_successful_analysis(monkeypatch)
+    _patch_failing_secret_lookup(monkeypatch, message="Secrets Manager get_secret_value failed: ResourceNotFoundException")
+    _patch_successful_sns_publish(monkeypatch)
+
+    worker = MonitoringWorker()
+    await worker._process_message({"Body": VALID_EVENT_BODY, "ReceiptHandle": "r-not-found"})
+
+    assert deleted["receipt_handle"] == "r-not-found"
+
+
+async def test_secret_empty_value_falls_back_to_sns(monkeypatch):
+    """item 6: Secret 값이 빈 문자열(SecretRetrievalError) -> SNS fallback.
+
+    app/providers/secrets_manager.py의 get_secret_value 자체가 빈
+    SecretString에 대해 SecretRetrievalError를 던지므로, worker
+    입장에서는 다른 조회 실패와 동일하게 처리된다.
+    """
+    deleted = {}
+    monkeypatch.setattr(
+        sqs_provider, "delete_message", lambda receipt_handle, client=None: deleted.__setitem__("receipt_handle", receipt_handle)
+    )
+    monkeypatch.setattr("app.services.monitoring_worker.settings.DISCORD_WEBHOOK_URL", None)
+    monkeypatch.setattr("app.services.monitoring_worker.settings.DISCORD_WEBHOOK_SECRET_ID", DISCORD_WEBHOOK_SECRET_ID)
+    _patch_successful_analysis(monkeypatch)
+    _patch_failing_secret_lookup(monkeypatch, message="Secret has no usable SecretString (empty)")
+    _patch_successful_sns_publish(monkeypatch)
+
+    worker = MonitoringWorker()
+    await worker._process_message({"Body": VALID_EVENT_BODY, "ReceiptHandle": "r-empty-secret"})
+
+    assert deleted["receipt_handle"] == "r-empty-secret"
+
+
+async def test_secret_failure_does_not_log_webhook_value(monkeypatch, caplog):
+    """item 7: Secret 조회 실패 로그/예외에 Webhook 값이 노출되지 않는다."""
+    monkeypatch.setattr(sqs_provider, "delete_message", lambda *a, **k: None)
+    monkeypatch.setattr("app.services.monitoring_worker.settings.DISCORD_WEBHOOK_URL", None)
+    monkeypatch.setattr("app.services.monitoring_worker.settings.DISCORD_WEBHOOK_SECRET_ID", DISCORD_WEBHOOK_SECRET_ID)
+    _patch_successful_analysis(monkeypatch)
+    _patch_failing_secret_lookup(monkeypatch, message="Secrets Manager get_secret_value failed: AccessDeniedException")
+    _patch_successful_sns_publish(monkeypatch)
+
+    worker = MonitoringWorker()
+    with caplog.at_level(logging.WARNING):
+        await worker._process_message({"Body": VALID_EVENT_BODY, "ReceiptHandle": "r-secret-log-check"})
+
+    for record in caplog.records:
+        assert DISCORD_WEBHOOK_URL not in record.getMessage()
+        for value in record.__dict__.values():
+            assert DISCORD_WEBHOOK_URL not in str(value)
+
+
+async def test_secret_failure_and_sns_failure_does_not_delete(monkeypatch):
+    """item 10: Secret 조회 실패 + SNS 실패 -> DeleteMessage 미호출(retry/DLQ 유지)."""
+    delete_called = {"value": False}
+    monkeypatch.setattr(
+        sqs_provider, "delete_message", lambda *a, **k: delete_called.__setitem__("value", True)
+    )
+    monkeypatch.setattr("app.services.monitoring_worker.settings.DISCORD_WEBHOOK_URL", None)
+    monkeypatch.setattr("app.services.monitoring_worker.settings.DISCORD_WEBHOOK_SECRET_ID", DISCORD_WEBHOOK_SECRET_ID)
+    _patch_successful_analysis(monkeypatch)
+    _patch_failing_secret_lookup(monkeypatch)
+    _patch_failing_sns_publish(monkeypatch)
+
+    worker = MonitoringWorker()
+    await worker._process_message({"Body": VALID_EVENT_BODY, "ReceiptHandle": "r-secret-and-sns-fail"})
+
+    assert delete_called["value"] is False
+
+
+# ---------------------------------------------------------------------------
+# 알림 정책: Discord Primary -> 실패/미설정 시 SNS Fallback. 어느 한쪽이든
+# 성공해야 DeleteMessage, 둘 다 실패하면 삭제하지 않는다.
 # ---------------------------------------------------------------------------
 
 
 async def test_discord_success_deletes_message_and_does_not_call_sns(monkeypatch):
-    """item 1, 9: Discord 성공 -> SNS 미호출 -> DeleteMessage 호출(중복 알림 없음)."""
+    """item 8, 12(중복 없음): Discord 성공 -> SNS 미호출 -> DeleteMessage 호출."""
     deleted = {}
     monkeypatch.setattr(
         sqs_provider, "delete_message", lambda receipt_handle, client=None: deleted.__setitem__("receipt_handle", receipt_handle)
@@ -246,7 +459,7 @@ async def test_discord_success_deletes_message_and_does_not_call_sns(monkeypatch
 
 
 async def test_discord_failure_falls_back_to_sns_and_deletes_on_success(monkeypatch):
-    """item 2: Discord 실패 -> SNS 호출 -> SNS 성공 -> DeleteMessage 호출."""
+    """item 9: Discord 실패 -> SNS 호출 -> SNS 성공 -> DeleteMessage 호출."""
     deleted = {}
     monkeypatch.setattr(
         sqs_provider, "delete_message", lambda receipt_handle, client=None: deleted.__setitem__("receipt_handle", receipt_handle)
@@ -265,7 +478,7 @@ async def test_discord_failure_falls_back_to_sns_and_deletes_on_success(monkeypa
 
 
 async def test_discord_failure_and_sns_failure_does_not_delete(monkeypatch):
-    """item 3: Discord 실패 + SNS 실패 -> DeleteMessage 미호출."""
+    """Discord 실패 + SNS 실패 -> DeleteMessage 미호출."""
     delete_called = {"value": False}
     monkeypatch.setattr(
         sqs_provider, "delete_message", lambda *a, **k: delete_called.__setitem__("value", True)
@@ -282,12 +495,13 @@ async def test_discord_failure_and_sns_failure_does_not_delete(monkeypatch):
 
 
 async def test_discord_unset_skips_discord_and_uses_sns(monkeypatch):
-    """item 4: Discord 미설정 -> Discord 미호출 -> SNS 호출 -> 성공 -> DeleteMessage 호출."""
+    """Discord/Secret 모두 미설정 -> Discord 미호출 -> SNS 호출 -> 성공 -> DeleteMessage 호출."""
     deleted = {}
     monkeypatch.setattr(
         sqs_provider, "delete_message", lambda receipt_handle, client=None: deleted.__setitem__("receipt_handle", receipt_handle)
     )
     monkeypatch.setattr("app.services.monitoring_worker.settings.DISCORD_WEBHOOK_URL", None)
+    monkeypatch.setattr("app.services.monitoring_worker.settings.DISCORD_WEBHOOK_SECRET_ID", None)
     _patch_successful_analysis(monkeypatch)
 
     discord_called = {"value": False}
@@ -303,76 +517,9 @@ async def test_discord_unset_skips_discord_and_uses_sns(monkeypatch):
     assert deleted["receipt_handle"] == "r-no-webhook"
 
 
-async def test_discord_unset_and_sns_failure_does_not_delete(monkeypatch):
-    """item 5: Webhook 미설정 + SNS 실패 -> DeleteMessage 미호출."""
-    delete_called = {"value": False}
-    monkeypatch.setattr(
-        sqs_provider, "delete_message", lambda *a, **k: delete_called.__setitem__("value", True)
-    )
-    monkeypatch.setattr("app.services.monitoring_worker.settings.DISCORD_WEBHOOK_URL", None)
-    _patch_successful_analysis(monkeypatch)
-    _patch_failing_sns_publish(monkeypatch)
-
-    worker = MonitoringWorker()
-    await worker._process_message({"Body": VALID_EVENT_BODY, "ReceiptHandle": "r-no-webhook-sns-fail"})
-
-    assert delete_called["value"] is False
-
-
-async def test_discord_429_falls_back_to_sns_without_crashing(monkeypatch):
-    """item 6: Discord 429(rate limit) -> worker crash 없음 -> SNS fallback."""
-    deleted = {}
-    monkeypatch.setattr(
-        sqs_provider, "delete_message", lambda receipt_handle, client=None: deleted.__setitem__("receipt_handle", receipt_handle)
-    )
-    monkeypatch.setattr("app.services.monitoring_worker.settings.DISCORD_WEBHOOK_URL", DISCORD_WEBHOOK_URL)
-    _patch_successful_analysis(monkeypatch)
-    _patch_failing_discord_publish(monkeypatch, message="Discord webhook returned HTTP 429")
-    _patch_successful_sns_publish(monkeypatch)
-
-    worker = MonitoringWorker()
-    await worker._process_message({"Body": VALID_EVENT_BODY, "ReceiptHandle": "r-429"})  # 예외 없이 반환되어야 한다
-
-    assert deleted["receipt_handle"] == "r-429"
-
-
-async def test_discord_5xx_falls_back_to_sns(monkeypatch):
-    """item 7: Discord 5xx -> SNS fallback."""
-    deleted = {}
-    monkeypatch.setattr(
-        sqs_provider, "delete_message", lambda receipt_handle, client=None: deleted.__setitem__("receipt_handle", receipt_handle)
-    )
-    monkeypatch.setattr("app.services.monitoring_worker.settings.DISCORD_WEBHOOK_URL", DISCORD_WEBHOOK_URL)
-    _patch_successful_analysis(monkeypatch)
-    _patch_failing_discord_publish(monkeypatch, message="Discord webhook returned HTTP 503")
-    _patch_successful_sns_publish(monkeypatch)
-
-    worker = MonitoringWorker()
-    await worker._process_message({"Body": VALID_EVENT_BODY, "ReceiptHandle": "r-5xx"})
-
-    assert deleted["receipt_handle"] == "r-5xx"
-
-
-async def test_discord_timeout_falls_back_to_sns(monkeypatch):
-    """item 8: Discord timeout -> SNS fallback."""
-    deleted = {}
-    monkeypatch.setattr(
-        sqs_provider, "delete_message", lambda receipt_handle, client=None: deleted.__setitem__("receipt_handle", receipt_handle)
-    )
-    monkeypatch.setattr("app.services.monitoring_worker.settings.DISCORD_WEBHOOK_URL", DISCORD_WEBHOOK_URL)
-    _patch_successful_analysis(monkeypatch)
-    _patch_failing_discord_publish(monkeypatch, message="Discord webhook request failed: TimeoutException")
-    _patch_successful_sns_publish(monkeypatch)
-
-    worker = MonitoringWorker()
-    await worker._process_message({"Body": VALID_EVENT_BODY, "ReceiptHandle": "r-timeout"})
-
-    assert deleted["receipt_handle"] == "r-timeout"
-
-
 async def test_discord_payload_sets_allowed_mentions_and_omits_raw_event(monkeypatch):
-    """item 10, 11: Discord로 전달되는 payload에 allowed_mentions.parse=[]가
-    있고, 원본 GuardDuty Event 전체가 포함되지 않는다."""
+    """Discord로 전달되는 payload에 allowed_mentions.parse=[]가 있고, 원본
+    GuardDuty Event 전체가 포함되지 않는다."""
     monkeypatch.setattr(sqs_provider, "delete_message", lambda *a, **k: None)
     monkeypatch.setattr("app.services.monitoring_worker.settings.DISCORD_WEBHOOK_URL", DISCORD_WEBHOOK_URL)
     _patch_successful_analysis(monkeypatch)
@@ -390,7 +537,7 @@ async def test_discord_payload_sets_allowed_mentions_and_omits_raw_event(monkeyp
 
 
 async def test_discord_failure_does_not_log_webhook_url(monkeypatch, caplog):
-    """item 12: Discord 실패 로그에도 Webhook URL이 노출되지 않는다."""
+    """Discord 실패 로그에도 Webhook URL이 노출되지 않는다."""
     monkeypatch.setattr(sqs_provider, "delete_message", lambda *a, **k: None)
     monkeypatch.setattr("app.services.monitoring_worker.settings.DISCORD_WEBHOOK_URL", DISCORD_WEBHOOK_URL)
     _patch_successful_analysis(monkeypatch)
@@ -408,7 +555,7 @@ async def test_discord_failure_does_not_log_webhook_url(monkeypatch, caplog):
 
 
 async def test_sample_finding_processed_normally_with_discord_configured(monkeypatch):
-    """item 13: sample=true Finding도 Discord/SNS 정책이 동일하게 적용된다(skip 없음)."""
+    """item 12: sample=true Finding도 Discord/SNS 정책이 동일하게 적용된다(skip 없음)."""
     deleted = {}
     monkeypatch.setattr(
         sqs_provider, "delete_message", lambda receipt_handle, client=None: deleted.__setitem__("receipt_handle", receipt_handle)
@@ -452,7 +599,7 @@ async def test_process_message_does_not_delete_when_guardduty_event_is_malformed
 
 
 async def test_process_message_does_not_delete_on_bedrock_error_and_calls_neither_channel(monkeypatch):
-    """item 14: Bedrock 실패 -> Discord/SNS 모두 미호출 -> DeleteMessage 미호출."""
+    """item 11: Bedrock 실패 -> Discord/SNS 모두 미호출 -> DeleteMessage 미호출."""
     delete_called = {"value": False}
     monkeypatch.setattr(
         sqs_provider, "delete_message", lambda *a, **k: delete_called.__setitem__("value", True)
@@ -505,6 +652,7 @@ async def test_run_once_processes_all_received_messages(monkeypatch):
     )
     monkeypatch.setattr(sqs_provider, "delete_message", lambda receipt_handle, client=None: deleted.append(receipt_handle))
     monkeypatch.setattr("app.services.monitoring_worker.settings.DISCORD_WEBHOOK_URL", None)
+    monkeypatch.setattr("app.services.monitoring_worker.settings.DISCORD_WEBHOOK_SECRET_ID", None)
     _patch_successful_analysis(monkeypatch)
     _patch_successful_sns_publish(monkeypatch)
 

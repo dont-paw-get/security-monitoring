@@ -68,6 +68,12 @@ def build_discord_payload(finding: GuardDutyFinding, analysis: SecurityAnalysis)
     allowed_mentions.parse=[]로 고정해, Finding title/description 등
     외부에서 흘러들어온 문자열에 @everyone/@here/사용자 멘션이 섞여
     있어도 실제 멘션이 발생하지 않게 한다.
+
+    발표/운영용 화면에 노출되는 이 payload에는 GuardDuty의 sample 여부를
+    표시하지 않는다(CLIAR-271 후속) — 내부 GuardDutyFinding.sample 값
+    자체나 구조화 로그(app/services/monitoring_worker.py의
+    _LOGGED_FINDING_FIELDS)는 그대로 유지되며, 이 함수의 출력에서만
+    제외한다.
     """
     risk_level = analysis.risk_level.value
     actions = "\n".join(
@@ -87,7 +93,6 @@ def build_discord_payload(finding: GuardDutyFinding, analysis: SecurityAnalysis)
             {"name": "원인", "value": _truncate(analysis.cause, _DISCORD_FIELD_VALUE_MAX_LENGTH), "inline": False},
             {"name": "영향", "value": _truncate(analysis.impact, _DISCORD_FIELD_VALUE_MAX_LENGTH), "inline": False},
             {"name": "권장 대응", "value": _truncate(actions, _DISCORD_FIELD_VALUE_MAX_LENGTH), "inline": False},
-            {"name": "Sample", "value": str(finding.sample), "inline": True},
         ],
     }
 
