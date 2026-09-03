@@ -1,0 +1,29 @@
+# dev 환경 전용 — security-monitoring 의 Prometheus 메트릭 스크레이핑 대상 등록.
+#
+# 인프라(`dpgy-infra`)의 Prometheus(monitoring 네임스페이스)는
+# serviceMonitorSelectorNilUsesHelmValues=false 로 떠 있어 네임스페이스·
+# 라벨 셀렉터 제약이 없다. 이 CR 이 dpyb-security-monitoring-dev
+# 네임스페이스에 있고 Service 를 올바로 가리키기만 하면 스크레이핑된다.
+#
+# prod 에는 두지 않는다(관측 인프라 연동은 dev 환경만 대상, backend-auth와
+# 동일한 정책). base 에도 두지 않아 prod overlay 로 새어들지 않게 한다.
+#
+# 노출 메트릭: http_server_requests_seconds_{bucket,sum,count}
+#   (Micrometer `http.server.requests` 호환 — app/core/metrics.py)
+#   라벨: application="security-monitoring", method, uri(라우트 템플릿),
+#         status, outcome
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: security-monitoring
+  labels:
+    app.kubernetes.io/name: security-monitoring
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: security-monitoring
+  endpoints:
+    # k8s/base/service.yaml 의 포트 이름. port 80 -> targetPort http(8000).
+    - port: http
+      path: /metrics
+      interval: 30s

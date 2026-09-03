@@ -1,0 +1,22 @@
+# 상용 환경에서 base ConfigMap 위에 덮어쓸 값
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: security-monitoring-config
+data:
+  APP_ENV: "production"
+
+  # ---- 관측 (app/core/observability.py) ----
+  #
+  # deployment.environment.name 은 Tempo/Loki 에서 dev·prod 텔레메트리를
+  # 구분하는 표준 리소스 속성이다. service.name 은 base 의
+  # OTEL_SERVICE_NAME("security-monitoring")에서 온다.
+  OTEL_RESOURCE_ATTRIBUTES: "deployment.environment.name=prod"
+  #
+  # TODO: OpenTelemetry Collector 주소를 주입해야 tracing 이 켜진다.
+  # collector 는 이 저장소가 아니라 dpgy-infra 가 소유하므로, 실제 prod
+  # Service DNS 를 확인한 뒤 아래 주석을 풀어 채운다(backend-auth prod
+  # overlay 와 동일한 미해결 상태). 값이 비어 있는 동안 애플리케이션은
+  # tracing 없이 정상 동작한다(구조화 로그는 그와 무관하게 이미 나간다).
+  #
+  # OTEL_EXPORTER_OTLP_ENDPOINT: "http://<collector-service>.<namespace>.svc.cluster.local:4318"

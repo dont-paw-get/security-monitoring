@@ -1,0 +1,144 @@
+name: Build & Push to ECR
+
+on:
+  push:
+    branches:
+      - develop         # develop → dev 환경
+      - main            # main → prod 환경
+    paths-ignore:
+      - "k8s/**"         # 태그 갱신 커밋이 무한루프 도는 것 방지
+      - "argocd/**"
+      - "docs/**"
+      - "**/*.md"
+  workflow_dispatch: {}  # 수동 실행도 허용
+
+permissions:
+  contents: write        # 매니페스트 이미지 태그 갱신 커밋을 위해
+  id-token: write        # GitHub OIDC(token.actions.githubusercontent.com) 토큰 발급 — AWS role-to-assume에 필요
+
+env:
+  AWS_REGION: ap-northeast-2
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 브랜치별로 대상 환경/ECR 리포/overlay/AWS Role을 먼저 결정합니다.
+      # AWS 인증(Configure AWS credentials)보다 반드시 먼저 실행해야
+      # dev/prod에 맞는 Role을 assume할 수 있습니다. 이 분기 판단
+      # (if [ "$REF_NAME" ... ])은 이 스텝 한 곳에서만 하고, 뒤 스텝들은
+      # 모두 이 출력만 참조합니다(중복 없음).
+      #   develop → dev  (gha-security-monitoring-ecr-dev,  dpyb-dev/dpyb-security-monitoring,  MUTABLE)
+      #   main    → prod (gha-security-monitoring-ecr-prod, dpyb-prod/dpyb-security-monitoring, IMMUTABLE)
+      #
+      # CLIAR-252: DEV/PROD Role을 분리한다(최소권한 원칙) — 이전에는
+      # 두 환경이 gha-security-monitoring-ecr 하나를 공유했다. 계정 ID
+      # (594532711953)는 k8s/overlays/{dev,prod}/kustomization.yaml의
+      # ECR 이미지 경로에 이미 하드코딩된 값을 그대로 재사용한다.
+      #
+      # 이번 CLIAR-252의 AWS 준비 범위는 DEV뿐이다 — PROD Role/ECR은
+      # 아직 생성되지 않았으므로 main 트리거는 AssumeRoleWithWebIdentity
+      # 단계에서 실패한다(README의 "AWS OIDC / IAM 요구사항" 참고).
+      - name: Resolve target by branch
+        id: target
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$REF_NAME" = "main" ]; then
+            ENV_NAME=prod; ECR_REPOSITORY=dpyb-prod/dpyb-security-monitoring
+            OVERLAY=k8s/overlays/prod/kustomization.yaml; IMMUTABLE=true
+            ROLE_ARN=arn:aws:iam::594532711953:role/gha-security-monitoring-ecr-prod
+          else
+            ENV_NAME=dev;  ECR_REPOSITORY=dpyb-dev/dpyb-security-monitoring
+            OVERLAY=k8s/overlays/dev/kustomization.yaml;  IMMUTABLE=false
+            ROLE_ARN=arn:aws:iam::594532711953:role/gha-security-monitoring-ecr-dev
+          fi
+          {
+            echo "env=${ENV_NAME}"
+            echo "ecr_repository=${ECR_REPOSITORY}"
+            echo "overlay=${OVERLAY}"
+            echo "immutable=${IMMUTABLE}"
+            echo "role_arn=${ROLE_ARN}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.target.outputs.role_arn }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # 멀티아키(linux/amd64 + linux/arm64) 빌드를 위한 준비.
+      # prod 클러스터는 노드가 전부 arm64(Graviton) 이고 dev 는 amd64/arm64 가
+      # 섞여 있는데, NodePool 에 아키텍처 제약이 없어 Karpenter 가 어느 쪽이든
+      # 띄울 수 있습니다. 단일 아키 이미지는 pull 은 성공하고 실행 시점에
+      # "exec format error" 로 죽으므로 두 아키를 모두 빌드해야 합니다.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # push 할 태그 목록을 계산합니다. registry는 ECR 로그인 이후에만
+      # 알 수 있으므로 branch 분기 판단(Resolve target by branch)과는
+      # 별도 스텝이다 — 분기 로직 자체는 여기서 다시 판단하지 않고 위
+      # 스텝의 출력(ecr_repository/immutable)만 그대로 사용한다.
+      # buildx 멀티플랫폼 빌드는 결과를 로컬 데몬에 남기지 않아 나중에
+      # `docker tag` 로 태그를 덧붙일 수 없고, 빌드 시점에 태그 목록을
+      # 전부 넘겨야 하기 때문에 미리 계산해 둔다.
+      - name: Compute image tags
+        id: tags
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ steps.target.outputs.ecr_repository }}
+          IMMUTABLE: ${{ steps.target.outputs.immutable }}
+          IMAGE_TAG: ${{ github.sha }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          {
+            echo "tags<<TAGS_EOF"
+            echo "${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+            if [ "$IMMUTABLE" != "true" ]; then
+              echo "${REGISTRY}/${ECR_REPOSITORY}:${REF_NAME}-latest"
+            fi
+            echo "TAGS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # 태그 목록은 위 두 스텝(target/tags)이 계산합니다. 커밋 SHA 태그는
+      # 항상 포함되고, movable 태그(<branch>-latest)는 MUTABLE 리포(dev)
+      # 에서만 붙습니다 — IMMUTABLE 리포(prod)는 같은 태그 재push 가
+      # 실패하기 때문입니다. provenance: false — attestation 매니페스트가
+      # 붙으면 ECR 콘솔과 일부 툴에서 unknown/unknown 아키텍처 항목으로
+      # 보입니다.
+      - name: Build & push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          provenance: false
+
+      - name: Bump overlay image tag (GitOps)
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          KFILE: ${{ steps.target.outputs.overlay }}
+          ENV_NAME: ${{ steps.target.outputs.env }}
+        run: |
+          # kustomization.yaml 의 newTag 값을 커밋 SHA 로 치환
+          sed -i -E "s/^(\s*newTag:).*/\1 ${IMAGE_TAG}/" "$KFILE"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet "$KFILE"; then
+            echo "이미지 태그 변경 없음"
+          else
+            git add "$KFILE"
+            git commit -m "chore(deploy): bump ${ENV_NAME} image tag to ${IMAGE_TAG}"
+            git push origin "HEAD:${{ github.ref_name }}"
+          fi
