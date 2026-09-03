@@ -4,6 +4,10 @@ pydantic==2.10.3
 pydantic-settings==2.6.1
 python-dotenv==1.0.1
 
+# aws (CLIAR-259: GuardDuty SQS consumer, app/providers/sqs.py)
+# 버전은 backend-auth의 기존 pin(boto3==1.35.75)을 그대로 따른다.
+boto3==1.35.75
+
 # observability
 #
 # 분산 추적: Application -> OTLP(http/protobuf) -> OpenTelemetry Collector

@@ -36,5 +36,20 @@ class Settings(BaseSettings):
     # monitoring_worker.py).
     MONITORING_ENABLED: bool = False
 
+    # CLIAR-259: GuardDuty SQS Consumer 설정.
+    #
+    # AWS_REGION: SQS/향후 다른 AWS SDK 호출 모두 이 리전을 쓴다(ECR/K8s와
+    # 동일하게 ap-northeast-2).
+    #
+    # SQS_GUARDDUTY_QUEUE_URL: EventBridge가 GuardDuty Finding을 전달하는
+    # DEV SQS 큐 URL. 계정/환경별 값이라 코드에 하드코딩하지 않고 이
+    # 설정으로만 주입한다. 기본값 None인 이유: MONITORING_ENABLED=false인
+    # 동안(현재 DEV 기본값)에는 이 값이 없어도 애플리케이션이 정상
+    # 기동해야 하기 때문이다 — MonitoringWorker.start()는 이 값이 없으면
+    # (MONITORING_ENABLED=true이더라도) polling을 시작하지 않고 에러
+    # 로그만 남긴다(app/services/monitoring_worker.py).
+    AWS_REGION: str = "ap-northeast-2"
+    SQS_GUARDDUTY_QUEUE_URL: str | None = None
+
 
 settings = Settings()
