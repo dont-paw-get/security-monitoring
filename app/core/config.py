@@ -76,5 +76,15 @@ class Settings(BaseSettings):
     # 결국 재시도만 반복하다 DLQ로 가버리는 상황을 애초에 막기 위함이다.
     SNS_ALERT_TOPIC_ARN: str | None = None
 
+    # CLIAR-271: Discord 보안 알림(Primary 채널) 설정.
+    #
+    # DISCORD_WEBHOOK_URL은 Secret이다 — 코드/K8s ConfigMap에 실제 값을
+    # 두지 않는다(향후 실제 Webhook이 준비되면 K8s Secret으로 주입한다).
+    # 기본값 None인 이유는 SNS_ALERT_TOPIC_ARN과 다르다 — 이 값이 없어도
+    # worker는 정상 시작하고, 매 Finding마다 SNS로만 알림을 보낸다
+    # (app/services/monitoring_worker.py) — Discord는 필수가 아니라
+    # "있으면 우선 쓰는" Primary 채널이다.
+    DISCORD_WEBHOOK_URL: str | None = None
+
 
 settings = Settings()

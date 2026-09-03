@@ -8,6 +8,12 @@ python-dotenv==1.0.1
 # 버전은 backend-auth의 기존 pin(boto3==1.35.75)을 그대로 따른다.
 boto3==1.35.75
 
+# discord webhook (CLIAR-271: 보안 알림 Primary 채널, app/providers/discord.py)
+# 원래 FastAPI TestClient가 내부적으로 필요로 해 "# test" 섹션에만
+# 있었지만, 이제 프로덕션 코드(Discord Incoming Webhook POST)에서도
+# 쓰므로 여기로 옮긴다 — 새 HTTP 라이브러리를 추가하지 않는다.
+httpx==0.28.0
+
 # observability
 #
 # 분산 추적: Application -> OTLP(http/protobuf) -> OpenTelemetry Collector
@@ -34,5 +40,4 @@ prometheus-client==0.22.1
 
 # test
 pytest==8.3.4
-httpx==0.28.0
 pytest-asyncio==0.24.0

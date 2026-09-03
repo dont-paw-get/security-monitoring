@@ -1,23 +1,28 @@
 """
-CLIAR-259/264/268: GuardDuty SQS Consumer + Bedrock AI 분석 + SNS 관리자 알림.
+CLIAR-259/264/268/271: GuardDuty SQS Consumer + Bedrock AI 분석 + Discord
+Primary/SNS Fallback 관리자 알림.
 
 MONITORING_ENABLED=false(기본값, app/core/config.py)면 아무 것도 하지
-않는다 — 앱은 워커 없이도 정상 기동/종료된다(boto3 client 생성/AWS API
-호출/polling이 전혀 발생하지 않는다). true이면 GuardDuty SQS 큐를 long
-polling으로 소비한다:
+않는다 — 앱은 워커 없이도 정상 기동/종료된다(boto3/httpx client 생성/AWS
+API 호출/polling이 전혀 발생하지 않는다). true이면 GuardDuty SQS 큐를
+long polling으로 소비한다:
 
     receive -> Body JSON parse -> GuardDuty Finding 정규화
     -> Bedrock AI 분석(app/services/security_analysis.py) -> 응답 검증
-    -> SNS 관리자 알림 발행(app/providers/sns.py)
+    -> Discord Webhook 발행 시도(설정된 경우만, app/providers/discord.py)
+       -> 성공: SNS는 호출하지 않는다(중복 알림 방지)
+       -> 실패 또는 DISCORD_WEBHOOK_URL 미설정: SNS Fallback 발행
+          (app/providers/sns.py)
     -> (성공) 구조화 로그 -> DeleteMessage
     -> (실패) 삭제하지 않음 -> VisibilityTimeout 후 재시도
        -> maxReceiveCount(5) 초과 시 큐의 기존 RedrivePolicy가 DLQ로 이동
 
-CLIAR-268 핵심 규칙: Bedrock 분석 성공+검증에 더해, SNS Publish까지
-성공해야만 "처리 성공"이며, 그때만 DeleteMessage를 호출한다. Bedrock이
-실패하면 SNS는 아예 호출하지 않는다. SNS Publish가 실패하면(AccessDenied/
-KMS 오류/Throttling/network 오류 등 무엇이든) 메시지를 삭제하지 않는다 —
-기존 재시도/DLQ 동작을 그대로 따른다.
+CLIAR-271 핵심 규칙: Bedrock 분석 성공+검증에 더해, (Discord 성공) 또는
+(Discord 실패/미설정 + SNS 성공) 중 하나여야만 "처리 성공"이며, 그때만
+DeleteMessage를 호출한다. Discord와 SNS가 모두 실패하면 메시지를
+삭제하지 않는다 — 기존 재시도/DLQ 동작을 그대로 따른다. Discord Webhook이
+아직 준비되지 않은 환경(DISCORD_WEBHOOK_URL 미설정)에서는 CLIAR-268의
+SNS 단독 흐름과 동일하게 동작한다.
 
 이 코드는 DLQ로 직접 SendMessage하지 않는다 — SQS 자체의
 RedrivePolicy만 사용한다.
@@ -28,9 +33,10 @@ import json
 import logging
 
 from app.core.config import settings
+from app.providers import discord as discord_provider
 from app.providers import sns as sns_provider
 from app.providers import sqs as sqs_provider
-from app.services.alert_message import build_alert
+from app.services.alert_message import build_alert, build_discord_payload
 from app.services.guardduty_parser import GuardDutyEventError, parse_guardduty_event
 from app.services.security_analysis import SecurityAnalysisError, analyze_finding
 
@@ -143,14 +149,15 @@ class MonitoringWorker:
             logger.warning("sqs delete_message failed", exc_info=True)
 
     async def _handle_body(self, body: str | None) -> bool:
-        """SQS 메시지 Body(JSON 문자열)를 파싱하고 Bedrock 분석 + SNS 알림까지 수행한다.
+        """SQS 메시지 Body(JSON 문자열)를 파싱하고 Bedrock 분석 + Discord/SNS 알림까지 수행한다.
 
         Returns:
             처리 성공 여부. False면 호출부가 메시지를 삭제하지 않는다 —
             JSON parsing 실패, GuardDuty 이벤트 구조 오류, Bedrock 호출
-            실패, AI 응답 검증 실패, SNS Publish 실패를 모두 포함한다
-            (CLIAR-268: Bedrock 분석 성공+검증에 더해 SNS Publish까지
-            성공해야 처리 성공이다).
+            실패, AI 응답 검증 실패, (Discord 실패/미설정 후) SNS Publish
+            실패까지 모두 포함한다(CLIAR-271: Bedrock 분석 성공+검증에
+            더해 Discord 또는 SNS 중 하나로 알림 발행까지 성공해야
+            처리 성공이다).
         """
         if body is None:
             logger.warning("sqs message has no body")
@@ -185,33 +192,61 @@ class MonitoringWorker:
             )
             return False
 
-        try:
-            subject, message = build_alert(finding, analysis)
-            message_id = await asyncio.to_thread(sns_provider.publish_alert, subject, message)
-        except sns_provider.SnsPublishError as exc:
-            # 알림 본문 전체/원본 Finding은 로그에 남기지 않는다 —
-            # finding_id/finding_type/risk_level/오류 범주만 남긴다.
-            # 메시지는 삭제하지 않고 기존 재시도/DLQ에 맡긴다.
-            logger.warning(
-                "security alert sns publish failed",
-                extra={
-                    "finding_id": finding.finding_id,
-                    "finding_type": finding.finding_type,
-                    "risk_level": analysis.risk_level.value,
-                    "error_category": type(exc).__name__,
-                },
-            )
-            return False
+        notification_channel: str | None = None
+        sns_message_id: str | None = None
+
+        if settings.DISCORD_WEBHOOK_URL:
+            try:
+                discord_payload = build_discord_payload(finding, analysis)
+                await asyncio.to_thread(discord_provider.publish_alert, discord_payload)
+                notification_channel = "discord"
+            except discord_provider.DiscordPublishError as exc:
+                # Webhook URL/payload 전체는 로그에 남기지 않는다 —
+                # finding_id/finding_type/risk_level/오류 범주만 남긴다.
+                # Discord 실패는 워커를 죽이지 않고 SNS fallback으로
+                # 넘어간다.
+                logger.warning(
+                    "discord webhook publish failed, falling back to sns",
+                    extra={
+                        "finding_id": finding.finding_id,
+                        "finding_type": finding.finding_type,
+                        "risk_level": analysis.risk_level.value,
+                        "error_category": type(exc).__name__,
+                    },
+                )
+
+        # Discord가 없거나(미설정) 방금 실패한 경우에만 SNS로 fallback한다.
+        # Discord가 성공했으면 SNS는 호출하지 않는다(중복 알림 방지).
+        if notification_channel is None:
+            try:
+                subject, message = build_alert(finding, analysis)
+                sns_message_id = await asyncio.to_thread(sns_provider.publish_alert, subject, message)
+                notification_channel = "sns_fallback"
+            except sns_provider.SnsPublishError as exc:
+                # 알림 본문 전체/원본 Finding은 로그에 남기지 않는다 —
+                # finding_id/finding_type/risk_level/오류 범주만 남긴다.
+                # Discord와 SNS가 모두 실패했으므로 메시지는 삭제하지
+                # 않고 기존 재시도/DLQ에 맡긴다.
+                logger.warning(
+                    "security alert sns publish failed",
+                    extra={
+                        "finding_id": finding.finding_id,
+                        "finding_type": finding.finding_type,
+                        "risk_level": analysis.risk_level.value,
+                        "error_category": type(exc).__name__,
+                    },
+                )
+                return False
 
         finding_fields = finding.model_dump()
-        logger.info(
-            "security alert published",
-            extra={
-                **{key: finding_fields[key] for key in _LOGGED_FINDING_FIELDS},
-                "risk_level": analysis.risk_level.value,
-                "sns_message_id": message_id,
-            },
-        )
+        log_extra = {
+            **{key: finding_fields[key] for key in _LOGGED_FINDING_FIELDS},
+            "risk_level": analysis.risk_level.value,
+            "notification_channel": notification_channel,
+        }
+        if sns_message_id is not None:
+            log_extra["sns_message_id"] = sns_message_id
+        logger.info("security alert published", extra=log_extra)
         return True
 
 
