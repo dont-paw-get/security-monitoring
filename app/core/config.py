@@ -78,13 +78,27 @@ class Settings(BaseSettings):
 
     # CLIAR-271: Discord 보안 알림(Primary 채널) 설정.
     #
-    # DISCORD_WEBHOOK_URL은 Secret이다 — 코드/K8s ConfigMap에 실제 값을
-    # 두지 않는다(향후 실제 Webhook이 준비되면 K8s Secret으로 주입한다).
-    # 기본값 None인 이유는 SNS_ALERT_TOPIC_ARN과 다르다 — 이 값이 없어도
-    # worker는 정상 시작하고, 매 Finding마다 SNS로만 알림을 보낸다
-    # (app/services/monitoring_worker.py) — Discord는 필수가 아니라
-    # "있으면 우선 쓰는" Primary 채널이다.
+    # Webhook URL을 얻는 방법은 둘이다 — app/services/monitoring_worker.py의
+    # MonitoringWorker._resolve_discord_webhook_url()이 아래 우선순위로
+    # Pod startup 시점에 한 번만 결정하고 메모리에 캐싱한다(매 Finding마다
+    # 다시 조회하지 않는다):
+    #
+    #   1. DISCORD_WEBHOOK_URL이 명시적으로 있으면 그대로 사용
+    #      (로컬 개발/테스트 override용 — 실제 DEV/PROD K8s ConfigMap에는
+    #      절대 두지 않는다).
+    #   2. 없고 DISCORD_WEBHOOK_SECRET_ID가 있으면 AWS Secrets Manager
+    #      (app/providers/secrets_manager.py)에서 조회.
+    #   3. 둘 다 없거나 조회에 실패하면 Discord는 비활성화되고, 이후 모든
+    #      알림은 SNS로만 발행된다(app/providers/sns.py) — Discord는
+    #      필수가 아니라 "있으면 우선 쓰는" Primary 채널이다.
+    #
+    # 두 값 모두 기본값 None이어도 worker는 정상 시작한다.
     DISCORD_WEBHOOK_URL: str | None = None
+
+    # Secrets Manager Secret 이름(ARN도 가능하지만 이름을 권장한다). 실제
+    # Webhook URL 값 자체는 여기에 두지 않는다 — Secret 이름만 코드/K8s
+    # ConfigMap에 둔다(이름은 비밀이 아니다).
+    DISCORD_WEBHOOK_SECRET_ID: str | None = None
 
 
 settings = Settings()

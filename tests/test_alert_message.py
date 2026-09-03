@@ -91,7 +91,6 @@ def test_build_discord_payload_includes_required_fields():
     assert field_values["영향"] == _ANALYSIS.impact
     for action in _ANALYSIS.recommended_actions:
         assert action in field_values["권장 대응"]
-    assert field_values["Sample"] == "False"
 
 
 def test_build_discord_payload_sets_allowed_mentions_parse_empty():
@@ -140,10 +139,19 @@ def test_build_discord_payload_truncates_long_fields_without_extra_llm_call():
     assert len(field_values["권장 대응"]) <= 1024
 
 
-def test_build_discord_payload_reflects_sample_flag():
+def test_build_discord_payload_does_not_display_sample_flag():
+    """발표/운영용 Discord 알림에는 GuardDuty sample 여부를 노출하지
+    않는다 — 단, 내부 GuardDutyFinding.sample 값 자체는 그대로 유지된다
+    (구조화 로그/E2E 확인용, app/services/monitoring_worker.py)."""
     sample_finding = _FINDING.model_copy(update={"sample": True})
 
     payload = build_discord_payload(sample_finding, _ANALYSIS)
 
-    field_values = {field["name"]: field["value"] for field in payload["embeds"][0]["fields"]}
-    assert field_values["Sample"] == "True"
+    assert sample_finding.sample is True  # 내부 값은 삭제되지 않는다
+
+    field_names = {field["name"] for field in payload["embeds"][0]["fields"]}
+    assert "Sample" not in field_names
+
+    serialized = str(payload)
+    assert "Sample" not in serialized
+    assert "sample=true" not in serialized.lower()

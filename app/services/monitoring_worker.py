@@ -1,6 +1,7 @@
 """
 CLIAR-259/264/268/271: GuardDuty SQS Consumer + Bedrock AI 분석 + Discord
-Primary/SNS Fallback 관리자 알림.
+Primary/SNS Fallback 관리자 알림(Discord Webhook URL은 AWS Secrets
+Manager 또는 로컬 override 환경변수에서 Pod startup 시 1회 조회).
 
 MONITORING_ENABLED=false(기본값, app/core/config.py)면 아무 것도 하지
 않는다 — 앱은 워커 없이도 정상 기동/종료된다(boto3/httpx client 생성/AWS
@@ -34,6 +35,7 @@ import logging
 
 from app.core.config import settings
 from app.providers import discord as discord_provider
+from app.providers import secrets_manager as secrets_manager_provider
 from app.providers import sns as sns_provider
 from app.providers import sqs as sqs_provider
 from app.services.alert_message import build_alert, build_discord_payload
@@ -61,6 +63,12 @@ class MonitoringWorker:
     def __init__(self, backoff_seconds: float = _ERROR_BACKOFF_SECONDS) -> None:
         self._backoff_seconds = backoff_seconds
         self._task: asyncio.Task | None = None
+        # CLIAR-271 Secrets Manager 연동: Discord Webhook URL은 이 worker
+        # 인스턴스 수명 동안 최초 1회만 확인/조회하고 메모리에 캐싱한다
+        # (_resolve_discord_webhook_url 참고) — 매 Finding마다 다시
+        # 조회하지 않는다.
+        self._discord_webhook_url: str | None = None
+        self._discord_webhook_resolved = False
 
     async def start(self) -> None:
         """MONITORING_ENABLED가 false면 아무 것도 하지 않는다.
@@ -88,8 +96,57 @@ class MonitoringWorker:
             return
         if self._task is not None:
             return
+
+        # CLIAR-271 Secrets Manager 연동: Discord Webhook URL을 Pod
+        # startup 시점에 한 번만 확인/조회한다(실패해도 worker 시작을
+        # 막지 않는다 — Discord는 선택 채널이고, 실패 시 SNS만으로 계속
+        # 동작해야 한다).
+        await self._resolve_discord_webhook_url()
+
         self._task = asyncio.create_task(self._run(), name="monitoring-worker")
         logger.info("monitoring worker started (guardduty sqs consumer)")
+
+    async def _resolve_discord_webhook_url(self) -> str | None:
+        """Discord Webhook URL을 최초 1회만 확인/조회하고 메모리에 캐싱한다.
+
+        우선순위(app/core/config.py의 DISCORD_WEBHOOK_URL 주석과 동일):
+        1) settings.DISCORD_WEBHOOK_URL이 명시적으로 있으면 그대로 사용
+           (로컬 개발/테스트 override용). 2) 없고
+           settings.DISCORD_WEBHOOK_SECRET_ID가 있으면 Secrets Manager에서
+           조회한다. 3) 둘 다 없거나 조회/값이 실패하면 None을 반환한다 —
+           이 경우 이후 모든 Finding은 SNS로만 알림이 간다. Secret 값은
+           파일에 저장하지 않고 이 인스턴스의 메모리에만 유지한다.
+        """
+        if self._discord_webhook_resolved:
+            return self._discord_webhook_url
+
+        webhook_url: str | None = None
+
+        if settings.DISCORD_WEBHOOK_URL:
+            webhook_url = settings.DISCORD_WEBHOOK_URL
+        elif settings.DISCORD_WEBHOOK_SECRET_ID:
+            try:
+                secret_value = await asyncio.to_thread(
+                    secrets_manager_provider.get_secret_value,
+                    settings.DISCORD_WEBHOOK_SECRET_ID,
+                )
+            except secrets_manager_provider.SecretRetrievalError as exc:
+                # Secret 값은 로그에 남기지 않는다 — secret_id/오류
+                # 범주만 남긴다. Secret 조회 실패는 worker를 죽이지 않고
+                # Discord를 비활성화한 채 SNS fallback으로만 동작한다.
+                logger.warning(
+                    "discord webhook secret retrieval failed, discord disabled (sns fallback only)",
+                    extra={
+                        "secret_id": settings.DISCORD_WEBHOOK_SECRET_ID,
+                        "error_category": type(exc).__name__,
+                    },
+                )
+            else:
+                webhook_url = secret_value
+
+        self._discord_webhook_url = webhook_url
+        self._discord_webhook_resolved = True
+        return webhook_url
 
     async def stop(self) -> None:
         """실행 중인 태스크를 취소하고 정상적으로 종료를 기다린다."""
@@ -195,10 +252,11 @@ class MonitoringWorker:
         notification_channel: str | None = None
         sns_message_id: str | None = None
 
-        if settings.DISCORD_WEBHOOK_URL:
+        webhook_url = await self._resolve_discord_webhook_url()
+        if webhook_url:
             try:
                 discord_payload = build_discord_payload(finding, analysis)
-                await asyncio.to_thread(discord_provider.publish_alert, discord_payload)
+                await asyncio.to_thread(discord_provider.publish_alert, webhook_url, discord_payload)
                 notification_channel = "discord"
             except discord_provider.DiscordPublishError as exc:
                 # Webhook URL/payload 전체는 로그에 남기지 않는다 —

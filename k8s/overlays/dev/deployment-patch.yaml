@@ -1,7 +1,8 @@
 # dev 환경 전용 — Pod template에 롤아웃 트리거용 annotation을 추가한다.
 # (CLIAR-260 후속: Runtime IAM/IRSA 및 DEV SQS 연동을 실제 Pod에 반영.
 #  CLIAR-264: Bedrock ConfigMap 값을 실제 Pod에 반영하기 위해 값을 갱신.
-#  CLIAR-268: SNS_ALERT_TOPIC_ARN ConfigMap 값을 실제 Pod에 반영하기 위해 값을 갱신.)
+#  CLIAR-268: SNS_ALERT_TOPIC_ARN ConfigMap 값을 실제 Pod에 반영하기 위해 값을 갱신.
+#  CLIAR-271: DISCORD_WEBHOOK_SECRET_ID ConfigMap 값을 실제 Pod에 반영하기 위해 값을 갱신.)
 #
 # 배경: ConfigMap 값(MONITORING_ENABLED 등)이나 ServiceAccount의
 # eks.amazonaws.com/role-arn annotation이 바뀌어도, 그 값들은
@@ -23,4 +24,4 @@ spec:
   template:
     metadata:
       annotations:
-        dpyb.dev/runtime-config-revision: "cliar-268"
+        dpyb.dev/runtime-config-revision: "cliar-271-secrets-manager"
