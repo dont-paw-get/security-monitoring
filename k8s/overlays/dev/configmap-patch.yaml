@@ -27,3 +27,15 @@ data:
   # dev 는 트레이스 검증이 목적이므로 전량 샘플링한다.
   OTEL_TRACES_SAMPLER: "parentbased_traceidratio"
   OTEL_TRACES_SAMPLER_ARG: "1.0"
+
+  # ---- GuardDuty SQS Consumer (CLIAR-260, app/providers/sqs.py) ----
+  #
+  # ServiceAccount는 이 dev overlay의 serviceaccount-patch.yaml에서 IRSA
+  # 롤(dpyb-security-monitoring-irsa-dev)을 부여받는다 — 이 Queue URL은
+  # 비밀값이 아니지만 SQS 접근 자체는 그 IRSA 롤로만 인증된다(static
+  # credential 없음).
+  AWS_REGION: "ap-northeast-2"
+  SQS_GUARDDUTY_QUEUE_URL: "https://sqs.ap-northeast-2.amazonaws.com/594532711953/dpyb-security-monitoring-guardduty-dev"
+  # base 기본값(false)을 dev에서만 켠다 — prod overlay는 이 patch를
+  # 상속하지 않으므로 여전히 false로 남는다.
+  MONITORING_ENABLED: "true"
