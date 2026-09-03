@@ -64,5 +64,17 @@ class Settings(BaseSettings):
     BEDROCK_REGION: str = "ap-northeast-2"
     BEDROCK_MODEL_ID: str = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
 
+    # CLIAR-268: Bedrock 분석 결과 관리자 알림(SNS) 설정.
+    #
+    # SNS_ALERT_TOPIC_ARN: 계정/환경별 값이라 코드에 하드코딩하지 않고 이
+    # 설정으로만 주입한다. 기본값 None인 이유는 SQS_GUARDDUTY_QUEUE_URL과
+    # 동일하다 — MONITORING_ENABLED=false인 동안에는 이 값이 없어도
+    # 애플리케이션이 정상 기동해야 한다. MONITORING_ENABLED=true인데 이
+    # 값이 없으면 SQS_GUARDDUTY_QUEUE_URL 누락과 마찬가지로 worker가
+    # polling을 시작하지 않는다(app/services/monitoring_worker.py) — SNS
+    # Publish 없이는 메시지를 삭제할 수 없어(CLIAR-268 규칙) 모든 메시지가
+    # 결국 재시도만 반복하다 DLQ로 가버리는 상황을 애초에 막기 위함이다.
+    SNS_ALERT_TOPIC_ARN: str | None = None
+
 
 settings = Settings()

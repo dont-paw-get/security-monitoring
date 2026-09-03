@@ -1,5 +1,5 @@
 """
-CLIAR-259/264: GuardDuty SQS Consumer + Bedrock AI 분석.
+CLIAR-259/264/268: GuardDuty SQS Consumer + Bedrock AI 분석 + SNS 관리자 알림.
 
 MONITORING_ENABLED=false(기본값, app/core/config.py)면 아무 것도 하지
 않는다 — 앱은 워커 없이도 정상 기동/종료된다(boto3 client 생성/AWS API
@@ -8,15 +8,16 @@ polling으로 소비한다:
 
     receive -> Body JSON parse -> GuardDuty Finding 정규화
     -> Bedrock AI 분석(app/services/security_analysis.py) -> 응답 검증
+    -> SNS 관리자 알림 발행(app/providers/sns.py)
     -> (성공) 구조화 로그 -> DeleteMessage
     -> (실패) 삭제하지 않음 -> VisibilityTimeout 후 재시도
        -> maxReceiveCount(5) 초과 시 큐의 기존 RedrivePolicy가 DLQ로 이동
 
-CLIAR-264 핵심 규칙: Bedrock 분석이 성공하고 응답이 스키마를 통과해야만
-"처리 성공"이며, 그때만 DeleteMessage를 호출한다. GuardDuty 파싱까지만
-성공하고 Bedrock 분석이 실패한 경우(AWS 오류/타임아웃/malformed 응답 등
-무엇이든)에도 메시지를 삭제하지 않는다 — 기존 재시도/DLQ 동작을 그대로
-따른다.
+CLIAR-268 핵심 규칙: Bedrock 분석 성공+검증에 더해, SNS Publish까지
+성공해야만 "처리 성공"이며, 그때만 DeleteMessage를 호출한다. Bedrock이
+실패하면 SNS는 아예 호출하지 않는다. SNS Publish가 실패하면(AccessDenied/
+KMS 오류/Throttling/network 오류 등 무엇이든) 메시지를 삭제하지 않는다 —
+기존 재시도/DLQ 동작을 그대로 따른다.
 
 이 코드는 DLQ로 직접 SendMessage하지 않는다 — SQS 자체의
 RedrivePolicy만 사용한다.
@@ -27,7 +28,9 @@ import json
 import logging
 
 from app.core.config import settings
+from app.providers import sns as sns_provider
 from app.providers import sqs as sqs_provider
+from app.services.alert_message import build_alert
 from app.services.guardduty_parser import GuardDutyEventError, parse_guardduty_event
 from app.services.security_analysis import SecurityAnalysisError, analyze_finding
 
@@ -39,10 +42,9 @@ logger = logging.getLogger(__name__)
 # 쓰는 짧은 재시도 대기이며, busy-loop를 막기 위한 것이다.
 _ERROR_BACKOFF_SECONDS = 5.0
 
-# 성공 로그에 남길 필드(item 15): finding_id/finding_type/severity/region/
+# 성공 로그에 남길 필드(item 8): finding_id/finding_type/severity/region/
 # sample은 Finding에서, risk_level은 분석 결과에서 가져온다. summary/
-# cause/impact/recommended_actions 등 AI 응답 본문은 로그에 남기지
-# 않는다(전체 AI 응답 무조건 로깅 금지).
+# cause/impact/recommended_actions/알림 본문 전체는 로그에 남기지 않는다.
 _LOGGED_FINDING_FIELDS = ("finding_id", "finding_type", "severity", "region", "sample")
 
 
@@ -67,6 +69,15 @@ class MonitoringWorker:
         if not settings.SQS_GUARDDUTY_QUEUE_URL:
             logger.error(
                 "monitoring worker cannot start: SQS_GUARDDUTY_QUEUE_URL is not configured"
+            )
+            return
+        if not settings.SNS_ALERT_TOPIC_ARN:
+            # CLIAR-268: SNS Publish가 성공해야만 메시지를 삭제하므로, 이
+            # 값이 없으면 모든 메시지가 결국 재시도만 반복하다 DLQ로
+            # 가버린다 — SQS_GUARDDUTY_QUEUE_URL 누락과 동일하게 아예
+            # polling을 시작하지 않는다.
+            logger.error(
+                "monitoring worker cannot start: SNS_ALERT_TOPIC_ARN is not configured"
             )
             return
         if self._task is not None:
@@ -132,13 +143,14 @@ class MonitoringWorker:
             logger.warning("sqs delete_message failed", exc_info=True)
 
     async def _handle_body(self, body: str | None) -> bool:
-        """SQS 메시지 Body(JSON 문자열)를 파싱하고 Bedrock으로 분석한다.
+        """SQS 메시지 Body(JSON 문자열)를 파싱하고 Bedrock 분석 + SNS 알림까지 수행한다.
 
         Returns:
             처리 성공 여부. False면 호출부가 메시지를 삭제하지 않는다 —
             JSON parsing 실패, GuardDuty 이벤트 구조 오류, Bedrock 호출
-            실패, AI 응답 검증 실패를 모두 포함한다(CLIAR-264: Bedrock
-            분석까지 성공해야 처리 성공이다).
+            실패, AI 응답 검증 실패, SNS Publish 실패를 모두 포함한다
+            (CLIAR-268: Bedrock 분석 성공+검증에 더해 SNS Publish까지
+            성공해야 처리 성공이다).
         """
         if body is None:
             logger.warning("sqs message has no body")
@@ -160,8 +172,9 @@ class MonitoringWorker:
             analysis = await asyncio.to_thread(analyze_finding, finding)
         except SecurityAnalysisError as exc:
             # 원본 GuardDuty 이벤트나 Bedrock 요청/응답 전문은 로그에
-            # 남기지 않는다 — finding_id/finding_type/오류 범주만 남긴다
-            # (item 14). 메시지는 삭제하지 않고 기존 재시도/DLQ에 맡긴다.
+            # 남기지 않는다 — finding_id/finding_type/오류 범주만 남긴다.
+            # Bedrock이 실패하면 SNS는 아예 호출하지 않는다. 메시지는
+            # 삭제하지 않고 기존 재시도/DLQ에 맡긴다.
             logger.warning(
                 "guardduty finding bedrock analysis failed",
                 extra={
@@ -172,12 +185,31 @@ class MonitoringWorker:
             )
             return False
 
+        try:
+            subject, message = build_alert(finding, analysis)
+            message_id = await asyncio.to_thread(sns_provider.publish_alert, subject, message)
+        except sns_provider.SnsPublishError as exc:
+            # 알림 본문 전체/원본 Finding은 로그에 남기지 않는다 —
+            # finding_id/finding_type/risk_level/오류 범주만 남긴다.
+            # 메시지는 삭제하지 않고 기존 재시도/DLQ에 맡긴다.
+            logger.warning(
+                "security alert sns publish failed",
+                extra={
+                    "finding_id": finding.finding_id,
+                    "finding_type": finding.finding_type,
+                    "risk_level": analysis.risk_level.value,
+                    "error_category": type(exc).__name__,
+                },
+            )
+            return False
+
         finding_fields = finding.model_dump()
         logger.info(
-            "guardduty finding analyzed",
+            "security alert published",
             extra={
                 **{key: finding_fields[key] for key in _LOGGED_FINDING_FIELDS},
                 "risk_level": analysis.risk_level.value,
+                "sns_message_id": message_id,
             },
         )
         return True

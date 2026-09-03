@@ -47,3 +47,10 @@ data:
   # (해당 Inference Profile 하나로만 스코핑됨). 값 자체는 비밀이 아니다.
   BEDROCK_REGION: "ap-northeast-2"
   BEDROCK_MODEL_ID: "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+
+  # ---- Bedrock 분석 결과 SNS 관리자 알림 (CLIAR-268, app/providers/sns.py) ----
+  #
+  # 위 IRSA 롤이 이 Topic 하나에 대한 sns:Publish와, alias/aws/sns 실제
+  # Key 하나에 대한 kms:GenerateDataKey*/kms:Decrypt만 가지고 있다. 값
+  # 자체는 비밀이 아니다.
+  SNS_ALERT_TOPIC_ARN: "arn:aws:sns:ap-northeast-2:594532711953:dpyb-security-monitoring-alerts-dev"
