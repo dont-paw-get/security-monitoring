@@ -51,5 +51,18 @@ class Settings(BaseSettings):
     AWS_REGION: str = "ap-northeast-2"
     SQS_GUARDDUTY_QUEUE_URL: str | None = None
 
+    # CLIAR-264: GuardDuty Finding Bedrock AI 분석 설정.
+    #
+    # BEDROCK_REGION: Bedrock Runtime 호출 전용 리전. SQS의 AWS_REGION과
+    # 분리해 두는 이유는 backend-record(app/core/config.py)와 동일하다 —
+    # 모델이 특정 리전에만 있을 수 있어, 향후 모델이 다른 리전으로
+    # 바뀌어도 SQS 설정과 독립적으로 바꿀 수 있게 한다. 현재 DEV는 SQS와
+    # 동일하게 ap-northeast-2를 쓴다.
+    #
+    # BEDROCK_MODEL_ID: 실제 모델/Inference Profile ID는 Python 코드에
+    # 하드코딩하지 않고 이 설정으로만 주입한다(app/providers/bedrock.py).
+    BEDROCK_REGION: str = "ap-northeast-2"
+    BEDROCK_MODEL_ID: str = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+
 
 settings = Settings()

@@ -39,3 +39,11 @@ data:
   # base 기본값(false)을 dev에서만 켠다 — prod overlay는 이 patch를
   # 상속하지 않으므로 여전히 false로 남는다.
   MONITORING_ENABLED: "true"
+
+  # ---- GuardDuty Finding Bedrock AI 분석 (CLIAR-264, app/providers/bedrock.py) ----
+  #
+  # 위 serviceaccount-patch.yaml의 동일 IRSA 롤(dpyb-security-monitoring-irsa-dev)이
+  # bedrock:InvokeModel / bedrock:GetInferenceProfile 권한도 가지고 있다
+  # (해당 Inference Profile 하나로만 스코핑됨). 값 자체는 비밀이 아니다.
+  BEDROCK_REGION: "ap-northeast-2"
+  BEDROCK_MODEL_ID: "global.anthropic.claude-haiku-4-5-20251001-v1:0"
